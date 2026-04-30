@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(source:*)",
+      "Bash(echo:*)",
+      "Bash(mkdir:*)",
+      "Bash(chmod:*)",
+      "Bash(git:*)",
+      "Bash(curl:*)",
+      "Bash(jq:*)",
+      "Bash(ssh:*)",
+      "Bash(sshpass:*)",
+      "Bash(./scripts/run.sh:*)",
+      "Bash(./scripts/status.sh:*)",
+      "Bash(./scripts/restart.sh:*)",
+      "Bash(./scripts/update.sh:*)",
+      "Bash(./scripts/backup.sh:*)",
+      "Bash(./scripts/tunnel.sh:*)",
+      "Bash(basename:*)",
+      "Bash(date:*)",
+      "Bash(sleep:*)"
+    ],
+    "deny": []
+  }
+}
