@@ -24,15 +24,27 @@ A [Claude Code](https://claude.ai/code)-powered operations agent for managing a 
 
 ## Quick Start
 
+### Recommended: via `/trinity:deploy`
+
+The easiest way to set this up is through the deploy skill in any Claude Code agent that has the [trinity plugin](https://github.com/abilityai/abilities) installed:
+
+```
+/trinity:deploy
+```
+
+It walks you through deploying Trinity (or connecting to an existing instance), then clones this repo, and fills in your `.env` automatically.
+
+### Manual setup
+
 ```bash
-git clone https://github.com/abilityai/trinity-ops-public.git
-cd trinity-ops-public
+git clone https://github.com/abilityai/trinity-ops-public.git my-instance-ops
+cd my-instance-ops
 
 cp .env.example .env
 # Edit .env with your connection details
 # Leave SSH_HOST empty if Trinity runs on this machine
 
-# Test it
+# Test the connection
 ./scripts/status.sh
 ```
 
@@ -91,6 +103,7 @@ trinity-ops-public/
 │   ├── status.sh           # Quick health check
 │   ├── restart.sh          # Restart services
 │   ├── update.sh           # Pull + rebuild + restart
+│   ├── backup.sh           # Database backup
 │   └── tunnel.sh           # SSH tunnels for local access
 ├── .claude/skills/         # Slash commands
 │   ├── status/   logs/   restart/   update/
