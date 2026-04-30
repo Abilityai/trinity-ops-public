@@ -1,6 +1,6 @@
 # Trinity Ops Agent
 
-> A universal, single-instance operator for [Trinity Deep Agent Platform](https://github.com/abilityai/trinity).
+> A universal, single-instance operator for [Trinity](https://github.com/abilityai/trinity) — autonomous agent orchestration infrastructure.
 > Manage Trinity anywhere — laptop, any VPS, any cloud — with one `.env` file.
 
 ---
@@ -184,12 +184,18 @@ All guides provision Ubuntu 24.04 with Docker via cloud-init, then walk you thro
 
 ### Installing Trinity on a Fresh Server
 
-After provisioning your VM:
+**One-line install (recommended):**
 
 ```bash
 # SSH into the server
 ssh user@<SERVER_IP>
 
+curl -fsSL https://raw.githubusercontent.com/abilityai/trinity/main/install.sh | bash
+```
+
+**Manual install:**
+
+```bash
 # Clone Trinity
 git clone https://github.com/abilityai/trinity.git ~/trinity
 cd ~/trinity
@@ -205,19 +211,21 @@ Minimum `.env` for Trinity:
 # Required
 ADMIN_PASSWORD=your-secure-password         # login password
 SECRET_KEY=$(openssl rand -hex 32)          # JWT signing key
-MCP_API_KEY=trinity_$(openssl rand -hex 16) # MCP server auth
 
 # For agents to run
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 ```bash
-# Start Trinity
-docker compose -f docker-compose.prod.yml up -d
+# Build base image and start services
+./scripts/deploy/build-base-image.sh
+./scripts/deploy/start.sh
 
 # Verify
 curl http://localhost:8000/health
 ```
+
+On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you to set your admin password and configure API keys.
 
 ---
 
@@ -227,7 +235,7 @@ curl http://localhost:8000/health
 |-----------|------|---------|
 | `trinity-backend` | 8000 | FastAPI REST API |
 | `trinity-frontend` | 80 | Vue.js Web UI |
-| `trinity-mcp-server` | 8180 | MCP Protocol Server |
+| `trinity-mcp-server` | 8080 | MCP Protocol Server |
 | `trinity-scheduler` | 8001 | Scheduled tasks |
 | `trinity-redis` | 6379 | Sessions, credentials |
 | `trinity-vector` | 8686 | Log aggregation |
@@ -307,27 +315,27 @@ TRINITY=${TRINITY_PATH:-~/trinity}
 | `COMPOSE_FILE` | `docker-compose.prod.yml` | Docker Compose file to use |
 | `FRONTEND_PORT` | `80` | Frontend web UI port |
 | `BACKEND_PORT` | `8000` | Backend API port |
-| `MCP_PORT` | `8180` | MCP server port |
+| `MCP_PORT` | `8080` | MCP server port |
 | `SCHEDULER_PORT` | `8001` | Scheduler health port |
 | `ADMIN_PASSWORD` | — | Trinity admin login |
 | `MCP_API_KEY` | — | MCP authentication key |
 | `TUNNEL_FRONTEND` | `13000` | Local tunnel port for frontend |
 | `TUNNEL_BACKEND` | `18000` | Local tunnel port for backend |
-| `TUNNEL_MCP` | `18180` | Local tunnel port for MCP |
+| `TUNNEL_MCP` | `18080` | Local tunnel port for MCP |
 
 ### Trinity server's `~/trinity/.env`
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `ADMIN_PASSWORD` | **Yes** | Admin login (no default) |
+| `ADMIN_PASSWORD` | **Yes** | Admin login |
 | `SECRET_KEY` | **Yes** | JWT signing |
-| `MCP_API_KEY` | **Yes** | MCP auth |
-| `CREDENTIAL_ENCRYPTION_KEY` | For subscriptions | Encrypt stored tokens |
-| `ANTHROPIC_API_KEY` | For agents | Claude API key |
+| `CREDENTIAL_ENCRYPTION_KEY` | **Yes** (production) | Encrypt stored tokens; loss = unrecoverable credentials |
+| `INTERNAL_API_SECRET` | Recommended | Scheduler→backend auth |
+| `ANTHROPIC_API_KEY` | For agents | Claude API key (or set in Settings UI) |
 | `GEMINI_API_KEY` | For avatars/voice | Gemini API key |
+| `GITHUB_PAT` | For GitHub templates | Access private agent template repos |
 | `PUBLIC_CHAT_URL` | For public links | External URL for public chat |
 | `TUNNEL_TOKEN` | For Cloudflare Tunnel | Enable `cloudflared` profile |
-| `INTERNAL_API_SECRET` | Recommended | Scheduler→backend auth |
 
 ---
 

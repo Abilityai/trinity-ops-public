@@ -1,6 +1,6 @@
 # Trinity Ops Agent
 
-A [Claude Code](https://claude.ai/code)-powered operations agent for managing a [Trinity Deep Agent Platform](https://github.com/abilityai/trinity) instance — on any server, any cloud, or your laptop.
+A [Claude Code](https://claude.ai/code)-powered operations agent for managing a [Trinity](https://github.com/abilityai/trinity) instance — autonomous agent orchestration infrastructure, on any server, any cloud, or your laptop.
 
 ```
 ┌───────────────────────────────────────────────────────┐
@@ -116,10 +116,6 @@ Once `.env` is configured, open Claude Code in this directory and ask things lik
 - *"How do I provision a Hetzner server?"*
 - *"My agent container won't start, help me debug"*
 
-## Relation to trinity-ops-agent
-
-`trinity-ops-agent` (Ability AI's internal repo) manages a fleet of 10+ client instances with GCP-specific provisioning, 1Password credential vaults, Tailscale VPN, GitHub Issues backlog, and multi-instance monitoring. This repo is the public, simplified version — one instance, any provider, no external service dependencies.
-
 ## License
 
-MIT — see [Trinity](https://github.com/abilityai/trinity) for the platform license.
+This repo is MIT. Trinity itself is licensed under the [Polyform Noncommercial License 1.0.0](https://github.com/abilityai/trinity/blob/main/LICENSE) — free for personal, research, non-profit, and hobby use; commercial use requires a separate license from [hello@ability.ai](mailto:hello@ability.ai).
