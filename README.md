@@ -9,7 +9,7 @@ A [Claude Code](https://claude.ai/code)-powered operations agent for managing a 
 │  .env  ────────────────────────────────►  Your server │
 │  scripts/run.sh                           (SSH or local)│
 │                                                       │
-│  /status  /update  /restart  /backup  /logs           │
+│  /status  /logs  /restart  /update  /diagnose         │
 └───────────────────────────────────────────────────────┘
 ```
 
@@ -17,8 +17,8 @@ A [Claude Code](https://claude.ai/code)-powered operations agent for managing a 
 
 - **Check health** — container states, HTTP endpoints, Redis, disk
 - **Update Trinity** — git pull, rebuild Docker images, restart, verify
-- **Manage agents** — list, start, stop, view logs
-- **Backup** — SQLite snapshot to `/tmp`
+- **Manage agents** — list, start, stop, view logs, rebuild containers
+- **Diagnose issues** — error scan across all services, resource usage, DB integrity
 - **Tunnel** — SSH port-forwarding for local browser access to remote instance
 - **Provision** — step-by-step guides for Hetzner, GCP, AWS, DigitalOcean, or localhost
 
@@ -64,26 +64,45 @@ The agent reads `CLAUDE.md` as its system prompt — it knows how to operate Tri
 | Disk | 20 GB | 50 GB |
 | OS | Ubuntu 22.04+ | Ubuntu 24.04 |
 
+## Available Skills
+
+| Skill | Description |
+|-------|-------------|
+| `/status` | Health check — backend, scheduler, containers, version |
+| `/logs <service> [lines] [errors]` | View logs for any service or agent |
+| `/restart [service\|all]` | Restart services with health verification |
+| `/update` | Pull latest, rebuild containers, restart, verify |
+| `/agents [list\|start\|stop\|logs\|exec]` | Manage agent containers |
+| `/rebuild-agent <name\|--all>` | Rebuild agent container from latest base image |
+| `/diagnose` | Full error scan — logs, restarts, disk, DB integrity |
+| `/telemetry` | CPU, memory, disk, container resource stats |
+| `/rollback [commit] [backup]` | Rollback to previous commit + optional DB restore |
+| `/cleanup [--execute]` | Prune Docker images, build cache, old backups |
+| `/provision [provider]` | Step-by-step provisioning for any cloud or localhost |
+
 ## File Structure
 
 ```
 trinity-ops-public/
-├── CLAUDE.md           # Agent instructions (read by Claude Code)
-├── .env.example        # Credential template
+├── CLAUDE.md               # Agent instructions (read by Claude Code)
+├── .env.example            # Credential template
 ├── scripts/
-│   ├── run.sh          # Execute command locally or via SSH
-│   ├── status.sh       # Quick health check
-│   ├── restart.sh      # Restart services
-│   ├── update.sh       # Pull + rebuild + restart
-│   ├── backup.sh       # Database backup
-│   └── tunnel.sh       # SSH tunnels for local access
+│   ├── run.sh              # Execute command locally or via SSH
+│   ├── status.sh           # Quick health check
+│   ├── restart.sh          # Restart services
+│   ├── update.sh           # Pull + rebuild + restart
+│   └── tunnel.sh           # SSH tunnels for local access
+├── .claude/skills/         # Slash commands
+│   ├── status/   logs/   restart/   update/
+│   ├── agents/   rebuild-agent/   diagnose/
+│   ├── telemetry/   rollback/   cleanup/   provision/
 └── provision/
-    ├── cloud-init.sh   # Docker bootstrap script
-    ├── localhost.md    # Local installation
-    ├── hetzner.md      # Hetzner Cloud
-    ├── gcp.md          # Google Cloud
-    ├── aws.md          # Amazon Web Services
-    └── digitalocean.md # DigitalOcean
+    ├── cloud-init.sh       # Docker bootstrap script
+    ├── localhost.md        # Local installation
+    ├── hetzner.md          # Hetzner Cloud
+    ├── gcp.md              # Google Cloud
+    ├── aws.md              # Amazon Web Services
+    └── digitalocean.md     # DigitalOcean
 ```
 
 ## Usage with Claude Code
