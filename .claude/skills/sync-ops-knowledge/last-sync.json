@@ -1,0 +1,15 @@
+{
+  "last_commit": "9a4655cf25747a112969caae5abbb8692a61b874",
+  "last_sync_date": "2026-05-05",
+  "instance_used": "local",
+  "changes_applied": [
+    "Service Architecture: Redis purpose updated to include WS auth tickets",
+    "Agent Management: added file-sharing enable note",
+    "New section: File Sharing (FILES-001) — MCP tool, API endpoints, download URLs",
+    "API Access: added ws/ticket, file download, list shared files, slack dm-default examples",
+    "Database Operations: added agent_shared_files query example and key tables reference",
+    "New section: Security Notes — WS ticket auth, MCP config validation, protected files",
+    "Troubleshooting: added .mcp.json validation error diagnosis entry"
+  ],
+  "changes_skipped": []
+}

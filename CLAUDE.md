@@ -122,6 +122,52 @@ source .env
 ./scripts/run.sh "sudo docker exec -it agent-myagent bash"
 ```
 
+File sharing is disabled per agent by default. Enable it via the Sharing panel in AgentDetail UI, or via API:
+
+```bash
+# Enable file sharing for an agent
+curl -s -X PATCH http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"file_sharing_enabled": true}'
+```
+
+---
+
+## File Sharing (FILES-001)
+
+Agents can publish files to users via token-scoped download URLs. The file must exist in the agent's `/home/developer/public/` directory.
+
+**From inside an agent** (via MCP tool):
+```
+share_file — publishes a file and returns a download URL (7-day default expiry)
+```
+
+**Ops tasks:**
+
+```bash
+source .env
+HOST=${SSH_HOST:-localhost}
+
+# Enable file sharing for an agent (also available in AgentDetail > Sharing panel)
+curl -s -X PATCH http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"file_sharing_enabled": true}'
+
+# List all shared files for an agent
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/files | jq
+
+# Revoke a shared file
+curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/files/<file_id> | jq
+```
+
+Download URLs follow the form: `http://<host>:<BACKEND_PORT>/api/files/<id>?token=<download_token>`
+
+Files expire after 7 days. One-time files are consumed on first download.
+
 ---
 
 ## API Access
@@ -143,6 +189,21 @@ curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api
 
 # Host telemetry (no auth)
 curl -s http://$HOST:${BACKEND_PORT:-8000}/api/telemetry/host | jq
+
+# Mint a WebSocket auth ticket (required before opening /ws)
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/ws/ticket | jq
+
+# Download a shared file (token from share_file MCP tool response)
+curl -s http://$HOST:${BACKEND_PORT:-8000}/api/files/<file_id>?token=<download_token> -o file.bin
+
+# List shared files for an agent
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/files | jq
+
+# Set Slack DM-default agent for a workspace
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/slack/channel/dm-default | jq
 ```
 
 ---
@@ -155,7 +216,19 @@ curl -s http://$HOST:${BACKEND_PORT:-8000}/api/telemetry/host | jq
 
 # Query agents
 ./scripts/run.sh "sudo docker run --rm -v trinity_trinity-data:/data alpine sh -c \"apk add --quiet sqlite && sqlite3 /data/trinity.db 'SELECT agent_name, owner_id FROM agent_ownership'\""
+
+# Query shared files (FILES-001)
+./scripts/run.sh "sudo docker run --rm -v trinity_trinity-data:/data alpine sh -c \"apk add --quiet sqlite && sqlite3 /data/trinity.db 'SELECT agent_name, filename, size_bytes, expires_at, revoked_at FROM agent_shared_files ORDER BY created_at DESC LIMIT 20'\""
 ```
+
+Key tables:
+
+| Table | Purpose |
+|-------|---------|
+| `agent_ownership` | Agent registry + per-agent flags (`file_sharing_enabled`) |
+| `agent_shared_files` | Outbound file shares — token-scoped download URLs with expiry |
+| `audit_log` | Audit trail (pruned to 365 days automatically) |
+| `slack_channels` | Slack workspace↔agent bindings + DM default routing |
 
 ---
 
@@ -237,9 +310,34 @@ On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you 
 | `trinity-frontend` | 80 | Vue.js Web UI |
 | `trinity-mcp-server` | 8080 | MCP Protocol Server |
 | `trinity-scheduler` | 8001 | Scheduled tasks |
-| `trinity-redis` | 6379 | Sessions, credentials |
+| `trinity-redis` | 6379 | Sessions, credentials, WS auth tickets |
 | `trinity-vector` | 8686 | Log aggregation |
 | `agent-{name}` | — | Per-agent isolated containers |
+
+---
+
+## Security Notes
+
+### WebSocket Authentication
+
+WebSocket connections use single-use tickets instead of JWT-in-URL. Browser clients must:
+1. Call `POST /api/ws/ticket` (with JWT in `Authorization` header) to mint a 30-second opaque ticket
+2. Open `/ws?ticket=<ticket>` — the ticket is consumed on first use
+
+Tickets live in Redis (`trinity-redis`). If Redis is down, WebSocket connections will fail.
+
+### MCP Config Validation
+
+`.mcp.json` files written via credential inject are validated by `mcp_validator.py` before reaching the agent container. This prevents RCE-by-config attacks (AISEC-C2). The validator enforces:
+- Command allowlist, no shell metachars, no path separators
+- HTTPS-only for HTTP/SSE transports with SSRF guard
+- Env var reference allowlist (no `PATH`, `LD_PRELOAD`, API keys, etc.)
+- Bounded: 64KB max, 32 servers max
+
+### Protected Files
+
+The following files cannot be written via `PUT /api/agents/{name}/files` or credential inject:
+`.mcp.json.template`, `.credentials.enc`, `.env*`, `.ssh/*`, `.aws/*`, `.gcp/*`, `.claude/settings*`, `.trinity/*`, `.git/*`
 
 ---
 
@@ -281,6 +379,19 @@ sleep 5
 ./scripts/run.sh "free -h"
 ./scripts/run.sh "sudo docker stats --no-stream"
 ```
+
+### Credential inject rejected for `.mcp.json`
+
+Trinity validates `.mcp.json` content before writing it (AISEC-C2 hardening). A 400 error means the content failed the MCP validator. Common causes:
+
+- `command` not in allowlist (`npx`, `uvx`, `python`, `python3`, `node`, `bun`, `deno`, `docker`)
+- Shell metacharacters (`&`, `;`, `|`, `$()`, backticks) in `command` or `args`
+- HTTP/SSE server URL is not HTTPS or resolves to a private/loopback address (SSRF guard)
+- Server named `trinity` (reserved — auto-injected by platform)
+- Env var references to reserved names (`PATH`, `LD_PRELOAD`, `ANTHROPIC_API_KEY`, etc.)
+- Content exceeds 64KB or more than 32 servers defined
+
+The error message from the API (`detail` field) identifies the specific rule that failed.
 
 ### Update broke things — rollback
 
