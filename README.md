@@ -22,7 +22,23 @@ A [Claude Code](https://claude.ai/code)-powered operations agent for managing a 
 - **Tunnel** — SSH port-forwarding for local browser access to remote instance
 - **Provision** — step-by-step guides for Hetzner, GCP, AWS, DigitalOcean, or localhost
 
-## Quick Start
+## Getting Started
+
+The recommended path is the `/trinity:deploy` wizard — available in any Claude Code agent that has the [abilities](https://github.com/abilityai/abilities) plugin installed:
+
+```
+/trinity:deploy
+```
+
+The wizard asks whether you're deploying to the cloud, a remote SSH server, or localhost — then handles Docker install, Trinity setup, `.env` configuration, and clones this repo into `~/{instance-name}-ops` pointed at your instance. When it's done, open the ops agent:
+
+```bash
+cd {instance-name}-ops && claude
+```
+
+## Manual Setup
+
+If you're wiring up an existing Trinity instance without the wizard:
 
 ### Recommended: via `/trinity:deploy`
 
