@@ -1,16 +1,20 @@
 {
-  "last_commit": "8af443fbb520fcd8ee9f400cae12d50792496915",
-  "last_sync_date": "2026-05-27",
+  "last_commit": "42938d7d9ceaf5635942fd96858f1c4999ee9d2b",
+  "last_sync_date": "2026-06-19",
   "instance_used": "local (~/Dropbox/trinity/trinity on dev branch)",
-  "commits_reviewed": 187,
+  "commits_reviewed": 183,
   "changes_applied": [
-    "Service Architecture: split network topology note (trinity-platform/trinity-agent), Redis ACL annotation, frontend 80:8080 mapping, UID 1000 notes (#874)",
-    "Provisioning > Minimum .env: noted start.sh auto-generates secrets and REDIS_* + DOCKER_GID (#443, #589)",
-    "Security Notes: new 'Redis ACL (#589)' and 'Non-root containers (#874)' subsections",
-    "API Access: added audit-log (list/stats/verify/export), canary violations + run-cycle, admin/soft-deleted recovery, A2A agent-card, sessions endpoints",
-    "Database Operations > Key tables: added agent_schedules.deleted_at, agent_sessions, agent_events, canary_violations, public_user_memory, public_chat_*; soft-delete note (#834)",
-    "Environment Variables Reference: added REDIS_BACKEND_PASSWORD, DOCKER_GID, TRINITY_DATA_PATH, HOST_TEMPLATES_PATH, GOOGLE_API_KEY, SMTP_*, SENDGRID_API_KEY, SLACK_SOCKET_CONNECTION_COUNT, LOG_RETENTION_DAYS/ARCHIVE_ENABLED/CLEANUP_HOUR, CANARY_ENABLED/SLACK_WEBHOOK_URL, OTEL_EXPORTER_OTLP_ENDPOINT",
-    "Troubleshooting: added Redis ACL lockout entry pointing to docs/migrations/REDIS_AUTH.md, DOCKER_GID detection entry, execution timeout note (15min->60min default)"
+    "NEW section 'Database Backend (SQLite default / PostgreSQL #300)': SQLite default vs experimental opt-in Postgres via DATABASE_URL; dev compose --profile postgres vs prod ships no bundled DB (operator-managed); Alembic owns PG schema (0001_baseline ~61 tables + audit triggers); no SQLite->PG ETL; backups (copy vs pg_dump); non-destructive rollback; pointer to docs/POSTGRESQL_SETUP.md",
+    "Service Architecture: added optional trinity-postgres (5432) row + network-topology note (postgres on platform-network, agents can never reach DB)",
+    "Database Operations: SQLite-only caveat banner + psql equivalents for Postgres; added agent_loops/agent_loop_runs (#740), idempotency_keys (#525), voip_bindings/voip_call_logs (VOIP-001) to Key tables",
+    "Backup Database: pg_dump variant for Postgres backend",
+    "API Access: added /api/executions + /api/executions/stats (#852), /api/agents/{name}/analytics (#932), /api/agents/{name}/circuit-breaker GET/PUT (#526)",
+    "Environment Variables Reference (server): added DATABASE_URL, DB_POOL_SIZE/DB_MAX_OVERFLOW, POSTGRES_DB/USER/PASSWORD, VOIP_ENABLED(+knobs), VOICE_ENABLED/VOICE_MODEL, WORKSPACE_ENABLED, GEMINI_TEXT_MODEL/TRANSCRIPTION_MODEL, PUBLIC_ACCESS_REQUESTS_ENABLED, DISPATCH_ASYNC, DISPATCH_TIMEOUT/PRE_CHECK_TIMEOUT, BACKEND_URL, EXTRA_CORS_ORIGINS, TELEMETRY_CONTAINER_STATS_TTL/DOCKER_POOL_SIZE",
+    "Troubleshooting: corrected stale per-task timeout entry (timeout_seconds deprecated #1068; per-agent execution_timeout_seconds authoritative #913/#922); added 'PostgreSQL backend won't connect' entry"
   ],
-  "changes_skipped": []
+  "changes_skipped": [
+    "License -> Apache 2.0 (#1139): noted in report; user chose to keep CLAUDE.md ops-focused with no licensing line",
+    "New MCP tools (run_agent_loop/stop_loop/get_loop_status #740, operator-queue list/get/respond #1104, call_user): agent-facing, not added to ops CLAUDE.md this pass",
+    "OpenAI Codex 3rd runtime (#1187) and model-list refresh (Opus 4.8): platform/feature detail, low ops relevance"
+  ]
 }

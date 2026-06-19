@@ -92,6 +92,12 @@ Pulls the latest code, rebuilds Docker images, restarts services, and verifies h
 # Saves to /tmp/trinity-<timestamp>.db on the host
 ```
 
+`backup.sh` copies the SQLite file. **If the instance runs on PostgreSQL** (`DATABASE_URL` set — see [Database Backend](#database-backend-sqlite-default--postgresql-300)), back up with `pg_dump` instead:
+
+```bash
+./scripts/run.sh "sudo docker exec trinity-postgres pg_dump -U \${POSTGRES_USER:-trinity} trinity" > trinity-pg-backup.sql
+```
+
 ### Tunnel (remote only)
 
 Opens SSH port-forwarding so you can browse Trinity locally while it's on a remote server:
@@ -233,11 +239,31 @@ curl -s http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/a2a/agent-card | j
 # Session Tab — start session, list, message, reset (#685, feature-gated)
 curl -s -X POST -H "Authorization: Bearer $TOKEN" \
   http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/session | jq
+
+# Fleet executions dashboard (#18 / #852) — list + summary stats
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://$HOST:${BACKEND_PORT:-8000}/api/executions?limit=50" | jq
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/executions/stats | jq
+
+# Per-schedule execution analytics (#868 / #932)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/analytics | jq
+
+# Per-agent dispatch circuit breaker (#526) — view + configure
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/circuit-breaker | jq
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/circuit-breaker \
+  -d '{"enabled": true}' | jq
 ```
 
 ---
 
 ## Database Operations
+
+> **Backend depends on `DATABASE_URL`.** The `sqlite3` recipes below target the **default SQLite** backend (file in the `trinity_trinity-data` volume). If the instance runs on **PostgreSQL** (see [Database Backend](#database-backend-sqlite-default--postgresql-300)), query it with `psql` instead — e.g. `./scripts/run.sh "sudo docker exec trinity-postgres psql -U trinity -d trinity -c 'SELECT agent_name, owner_id FROM agent_ownership'"`. Schema is identical across both backends.
 
 ```bash
 # List tables
@@ -259,6 +285,9 @@ Key tables:
 | `agent_shared_files` | Outbound file shares — token-scoped download URLs with expiry |
 | `agent_sessions` / `agent_session_messages` | Session Tab persistent chat (SESSION_TAB_2026-04, feature-gated) |
 | `agent_events` / `agent_event_subscriptions` | Event bus (EVT-001) — emit/subscribe between agents |
+| `agent_loops` / `agent_loop_runs` | Sequential agent loops (#740) — `run_agent_loop` MCP tool + web UI |
+| `idempotency_keys` | Dedup at execution-trigger boundaries (#525) — prevents double-dispatch |
+| `voip_bindings` / `voip_call_logs` | VoIP telephony (VOIP-001 / #1056) — per-agent Twilio creds + outbound call log |
 | `audit_log` | Audit trail with hash chain (SEC-001 / #20). Pruned to 365 days automatically |
 | `canary_violations` | Orchestration-invariant violations (CANARY-001 / #411) |
 | `public_user_memory` | Per-user memory written by `write_user_memory` MCP tool (MEM-001 / #888) |
@@ -350,11 +379,44 @@ On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you 
 | `trinity-scheduler` | 8001:8001 | Scheduled tasks — runs as UID 1000 |
 | `trinity-redis` | 6379:6379 | Sessions, credentials, WS auth tickets — ACL-protected, two users (#589) |
 | `trinity-vector` | 8686:8686 | Log aggregation |
+| `trinity-postgres` | 5432:5432 | **Optional** PostgreSQL backend (#300) — dev-compose only, behind `--profile postgres`. Off by default (SQLite). See [Database Backend](#database-backend-sqlite-default--postgresql-300). |
 | `agent-{name}` | — | Per-agent isolated containers |
 
 **Network topology (#589):** Two bridges replace the old single network.
-- `trinity-platform-network` — Redis, scheduler, backend, mcp-server, vector, otel. Agents NEVER join.
+- `trinity-platform-network` — Redis, scheduler, backend, mcp-server, vector, otel, **postgres**. Agents NEVER join (so agents can never reach the database).
 - `trinity-agent-network` — agents, frontend, plus bridges (backend, mcp-server, otel, cloudflared). Name preserved for backward compatibility.
+
+---
+
+## Database Backend (SQLite default / PostgreSQL #300)
+
+Trinity selects its database from a single env var, `DATABASE_URL`, resolved at backend startup. **SQLite is the zero-config default and its behavior is unchanged** — PostgreSQL is experimental and entirely opt-in.
+
+| `DATABASE_URL` | Backend |
+|----------------|---------|
+| *unset* or empty | **SQLite** at `TRINITY_DB_PATH` (default `/data/trinity.db`) |
+| `sqlite:////data/trinity.db` | SQLite (explicit) |
+| `postgresql://user:pass@host:5432/dbname` | **PostgreSQL** |
+
+Both the backend and the standalone scheduler read the same `DATABASE_URL`, so they always agree on the store. The flag is **not sticky** — switching is non-destructive (the two stores are independent volumes); comment it out and the next restart is back on SQLite.
+
+**Dev vs prod is the key ops distinction:**
+- **Dev `docker-compose.yml`** bundles a `postgres:16-alpine` service (container `trinity-postgres`) gated behind the `postgres` **compose profile**. Enable with `POSTGRES_PASSWORD` set, then `docker compose --profile postgres up -d`.
+- **Prod `docker-compose.prod.yml` ships NO postgres service.** A `postgresql://` URL in prod must point at an **operator-managed** PostgreSQL (RDS, Cloud SQL, a separate VM). The backend/scheduler/agent containers must be able to reach that host:port.
+
+**On first (cold) start** against an empty Postgres, the backend runs `alembic upgrade head` — the `0001_baseline` revision builds all ~61 tables plus append-only audit-log triggers, then seeds the admin user from `ADMIN_PASSWORD`. The instance starts in first-run setup (`setup_required` on login is expected, not an error). Alembic owns the PG schema; **SQLite keeps its separate `db/migrations.py` runner** — the two coexist during the transition.
+
+**Migrating an existing SQLite instance:** upstream's `init_database()` only *bootstraps* a fresh PG DB — it has no SQLite→PG data copy. This ops agent ships the **`/migrate-to-postgres`** skill (`.claude/skills/migrate-to-postgres/`) to close that gap: it stands up Postgres alongside the running instance, trial-copies + validates the data via a dialect-aware ETL, then cuts over in a short downtime window with one-line rollback (the SQLite file is never written). Gated at every state-changing step.
+
+**Limitations:**
+- A brand-new Postgres DB (no `/migrate-to-postgres` run) is *fresh and empty* — enabling `DATABASE_URL` alone copies no data.
+- Experimental — not yet the recommended production default. New SQL must stay dialect-portable.
+
+**Backups:** SQLite = copy `trinity.db` (`scripts/backup.sh`); PostgreSQL = `pg_dump` (see [Backup Database](#backup-database)).
+
+**Rollback to SQLite:** comment out `DATABASE_URL`, `docker compose up -d` — the Postgres volume is untouched and can be re-enabled later.
+
+Full guide on the server: `docs/POSTGRESQL_SETUP.md` (covers verification, pooling tunables, dialect gotchas). Selector code: `src/backend/db/engine.py`.
 
 ---
 
@@ -469,7 +531,22 @@ Re-run `start.sh` to auto-detect, or set `DOCKER_GID=<gid>` manually and `docker
 
 ### Long-running agent task killed at 60min
 
-Default execution timeout was bumped 15min → 60min (#665). If a task still hits the wall, set a longer per-schedule timeout via `PUT /api/schedules/{id}` (the canary-fleet header documents the `timeout_seconds` field).
+Default execution timeout was bumped 15min → 60min (#665). The deadline is now the **per-agent** `execution_timeout_seconds` (clamped by the schedule cap, #929) — the scheduler honors it (#913 / #922). The old **per-task `timeout_seconds` override is deprecated** (#1068): still honored-but-clamped this release, removed in a follow-up. To extend the wall, raise the agent's `execution_timeout_seconds` (Agent Detail → Settings, or `PATCH /api/agents/{name}`) rather than passing a per-task override.
+
+### PostgreSQL backend won't connect
+
+Only relevant when `DATABASE_URL` is set to a `postgresql://` URL (see [Database Backend](#database-backend-sqlite-default--postgresql-300)).
+
+```bash
+# Is the backend actually on Postgres?
+./scripts/run.sh "sudo docker exec trinity-backend python -c \"import db.engine as e; print('sqlite:', e.is_sqlite())\""
+./scripts/run.sh "sudo docker logs trinity-backend --tail 50 2>&1 | grep -iE 'postgres|alembic|database'"
+```
+
+- **`could not translate host name \"postgres\"`** — dev: the `postgres` profile isn't up (`docker compose --profile postgres up -d postgres`). Prod: there is no bundled service — point `DATABASE_URL` at a reachable operator-managed host (not `localhost`).
+- **Password mismatch** — the password in `DATABASE_URL` must equal `POSTGRES_PASSWORD` (bundled service) or the managed DB's role password.
+- **`{"detail":"setup_required"}` on login** — expected first-run gate on any fresh DB (there's no SQLite→PG data migration; a new Postgres DB starts empty). Complete the setup wizard.
+- Rollback is non-destructive: comment out `DATABASE_URL`, `docker compose up -d` → back on SQLite.
 
 ### Credential inject rejected for `.mcp.json`
 
@@ -555,6 +632,19 @@ TRINITY=${TRINITY_PATH:-~/trinity}
 | `CANARY_ENABLED` | Staging/dev | Run 5-min invariant watcher loop (default 0) |
 | `CANARY_SLACK_WEBHOOK_URL` | Optional | Slack webhook for canary green→red transitions |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Optional | OpenTelemetry collector endpoint |
+| `DATABASE_URL` | Optional (#300) | DB selector. Unset/empty → SQLite at `/data/trinity.db`; `postgresql://…` → PostgreSQL. Prod ships no bundled DB — point at a managed Postgres. See [Database Backend](#database-backend-sqlite-default--postgresql-300) |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | PostgreSQL only | Pool size (10) / burst overflow (20). Ignored on SQLite |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | dev `postgres` profile | Bundled `trinity-postgres` creds. `POSTGRES_PASSWORD` required when the profile is enabled; must match the password in `DATABASE_URL` |
+| `VOIP_ENABLED` | Optional (VOIP-001 / #1056) | Outbound phone calls via Twilio Media Streams over Gemini Live. Default OFF; per-agent `voip_bindings` still required to place calls. `VOIP_MAX_CALL_DURATION`/`VOIP_DEFAULT_DAILY_CALL_CAP`/`VOIP_CALL_RATE_LIMIT`/`VOIP_CALL_RATE_WINDOW`/`VOIP_*_TTL_SECONDS` are spend/abuse controls |
+| `VOICE_ENABLED` / `VOICE_MODEL` | Optional (VOICE-001) | Voice chat over Gemini Live (default ON). Leave `VOICE_MODEL` commented — an empty value shadows the default and breaks voice (#1076) |
+| `WORKSPACE_ENABLED` | Optional (BETA #860) | Voice Workspace canvas (default false) |
+| `GEMINI_TEXT_MODEL` / `GEMINI_TRANSCRIPTION_MODEL` | Optional (#1130) | Override built-in Gemini defaults. Leave commented unless overriding (#1076) |
+| `PUBLIC_ACCESS_REQUESTS_ENABLED` | Optional (default false) | Default-deny public self-signup on `POST /api/access/request`; whitelist stays authoritative unless `true` |
+| `DISPATCH_ASYNC` | Optional (#1083) | Fire-and-forget dispatch for autonomous turns (default false; safe to flip — non-202 falls back to sync) |
+| `DISPATCH_TIMEOUT` / `PRE_CHECK_TIMEOUT` | Optional (#1022) | Scheduler→backend dispatch (30s) / pre-check (70s) deadlines |
+| `BACKEND_URL` | For OAuth | Backend's public origin used to build OAuth redirect URIs (default `http://localhost:8000`) |
+| `EXTRA_CORS_ORIGINS` | Optional | Comma-separated extra allowed CORS origins |
+| `TELEMETRY_CONTAINER_STATS_TTL` / `TELEMETRY_DOCKER_POOL_SIZE` | Optional (#1096) | `/api/telemetry/containers` cache freshness in s (10) / max concurrent Docker stat fetches (16) |
 
 ---
 
