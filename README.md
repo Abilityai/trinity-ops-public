@@ -19,6 +19,7 @@ A [Claude Code](https://claude.ai/code)-powered operations agent for managing a 
 - **Update Trinity** — git pull, rebuild Docker images, restart, verify
 - **Manage agents** — list, start, stop, view logs, rebuild containers
 - **Diagnose issues** — error scan across all services, resource usage, DB integrity
+- **Migrate the database** — move from SQLite to PostgreSQL with validation and one-line rollback
 - **Tunnel** — SSH port-forwarding for local browser access to remote instance
 - **Provision** — step-by-step guides for Hetzner, GCP, AWS, DigitalOcean, or localhost
 
@@ -106,7 +107,9 @@ The agent reads `CLAUDE.md` as its system prompt — it knows how to operate Tri
 | `/telemetry` | CPU, memory, disk, container resource stats |
 | `/rollback [commit] [backup]` | Rollback to previous commit + optional DB restore |
 | `/cleanup [--execute]` | Prune Docker images, build cache, old backups |
+| `/migrate-to-postgres` | Migrate the database from SQLite to PostgreSQL — parallel-validate-then-cut-over, gated, with one-line rollback |
 | `/provision [provider]` | Step-by-step provisioning for any cloud or localhost |
+| `/sync-ops-knowledge` | Review recent Trinity changes and update this agent's `CLAUDE.md` + skills |
 
 ## File Structure
 
@@ -125,6 +128,8 @@ trinity-ops-public/
 │   ├── status/   logs/   restart/   update/
 │   ├── agents/   rebuild-agent/   diagnose/
 │   ├── telemetry/   rollback/   cleanup/   provision/
+│   ├── migrate-to-postgres/ # incl. scripts/sqlite_to_pg_etl.py
+│   └── sync-ops-knowledge/
 └── provision/
     ├── cloud-init.sh       # Docker bootstrap script
     ├── localhost.md        # Local installation
@@ -147,4 +152,4 @@ Once `.env` is configured, open Claude Code in this directory and ask things lik
 
 ## License
 
-This repo is MIT. Trinity itself is licensed under the [Polyform Noncommercial License 1.0.0](https://github.com/abilityai/trinity/blob/main/LICENSE) — free for personal, research, non-profit, and hobby use; commercial use requires a separate license from [hello@ability.ai](mailto:hello@ability.ai).
+This repo is MIT. Trinity itself is licensed under the [Apache License 2.0](https://github.com/abilityai/trinity/blob/main/LICENSE) — free for any use, commercial included, with an explicit patent grant; run it on your own infrastructure, any cloud, or a managed instance. Optional enterprise modules (SSO, user management, SIEM export, and more) are available under a separate commercial license — contact [hello@ability.ai](mailto:hello@ability.ai).
