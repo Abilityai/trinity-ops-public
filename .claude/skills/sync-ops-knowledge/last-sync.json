@@ -1,20 +1,25 @@
 {
-  "last_commit": "42938d7d9ceaf5635942fd96858f1c4999ee9d2b",
-  "last_sync_date": "2026-06-19",
-  "instance_used": "local (~/Dropbox/trinity/trinity on dev branch)",
-  "commits_reviewed": 183,
+  "last_commit": "c6a2be5e2ccb86e6456a29bcf20195bf719b610f",
+  "last_sync_date": "2026-06-23",
+  "instance_used": "local (~/Dropbox/trinity/trinity on main, v0.7.0 release #1319)",
+  "commits_reviewed": 15,
+  "note": "Baseline switched from the dev branch (prior 42938d7d, now gone from history) to main at the tagged v0.7.0 release. ~/trinity is a stale April dev checkout (#554) and is NOT the canonical source — use ~/Dropbox/trinity/trinity on main.",
   "changes_applied": [
-    "NEW section 'Database Backend (SQLite default / PostgreSQL #300)': SQLite default vs experimental opt-in Postgres via DATABASE_URL; dev compose --profile postgres vs prod ships no bundled DB (operator-managed); Alembic owns PG schema (0001_baseline ~61 tables + audit triggers); no SQLite->PG ETL; backups (copy vs pg_dump); non-destructive rollback; pointer to docs/POSTGRESQL_SETUP.md",
-    "Service Architecture: added optional trinity-postgres (5432) row + network-topology note (postgres on platform-network, agents can never reach DB)",
-    "Database Operations: SQLite-only caveat banner + psql equivalents for Postgres; added agent_loops/agent_loop_runs (#740), idempotency_keys (#525), voip_bindings/voip_call_logs (VOIP-001) to Key tables",
-    "Backup Database: pg_dump variant for Postgres backend",
-    "API Access: added /api/executions + /api/executions/stats (#852), /api/agents/{name}/analytics (#932), /api/agents/{name}/circuit-breaker GET/PUT (#526)",
-    "Environment Variables Reference (server): added DATABASE_URL, DB_POOL_SIZE/DB_MAX_OVERFLOW, POSTGRES_DB/USER/PASSWORD, VOIP_ENABLED(+knobs), VOICE_ENABLED/VOICE_MODEL, WORKSPACE_ENABLED, GEMINI_TEXT_MODEL/TRANSCRIPTION_MODEL, PUBLIC_ACCESS_REQUESTS_ENABLED, DISPATCH_ASYNC, DISPATCH_TIMEOUT/PRE_CHECK_TIMEOUT, BACKEND_URL, EXTRA_CORS_ORIGINS, TELEMETRY_CONTAINER_STATS_TTL/DOCKER_POOL_SIZE",
-    "Troubleshooting: corrected stale per-task timeout entry (timeout_seconds deprecated #1068; per-agent execution_timeout_seconds authoritative #913/#922); added 'PostgreSQL backend won't connect' entry"
+    "Security Notes: NEW 'Agent Auth Secret (Issue #1159)' subsection — master secret backend derives each agent's in-container :8000 token from; stability critical (rotation 401s the whole fleet until recreate); prod compose forwards it explicitly; backend hard-fails if unset",
+    "API Access: added agent runtime-data export/import (POST /api/agents/{name}/data/export | /data/import, #1169) and compatibility report/fix (GET /api/agents/{name}/compatibility, POST .../compatibility/fix, #668)",
+    "Database Operations Key tables: added agent_compatibility_results (#668)",
+    "Troubleshooting: NEW 'Backend flaps to unhealthy during scheduled-batch windows' (#1230 relaxed healthcheck 30s/5/60s) and 'Whole fleet returns 401 after a config change' (AGENT_AUTH_SECRET #1159)",
+    "Env table (server): added AGENT_AUTH_SECRET (auto-gen, after REDIS_BACKEND_PASSWORD), AGENT_TMP_SIZE (#1231), MCP_AGENT_CHAT_PULL_ENABLED (#946), OPERATOR_INTAKE_ENABLED/URL (ent#38), AGENT_DATA_EXPORT_MAX_BYTES/INLINE_MAX_BYTES (#1169)",
+    "Installing section: added AGENT_AUTH_SECRET to the start.sh auto-generated secrets list (#1159)"
   ],
   "changes_skipped": [
-    "License -> Apache 2.0 (#1139): noted in report; user chose to keep CLAUDE.md ops-focused with no licensing line",
-    "New MCP tools (run_agent_loop/stop_loop/get_loop_status #740, operator-queue list/get/respond #1104, call_user): agent-facing, not added to ops CLAUDE.md this pass",
-    "OpenAI Codex 3rd runtime (#1187) and model-list refresh (Opus 4.8): platform/feature detail, low ops relevance"
+    "New MCP tools export_agent_data/import_agent_data/get_agent_compatibility_report (#1169/#668): agent-facing — per prior convention, not added to ops CLAUDE.md (the operator-facing HTTP endpoints were documented instead)",
+    "License -> Apache 2.0 (#1139, e24e55b5): already reconciled in ops README (commit 546e24e); CLAUDE.md stays ops-focused with no licensing line",
+    "Dep bumps (dompurify/undici/hono/vite/vitest/form-data), Dependabot grouping/CI shims (#1243/#1222/#1224 CSP), demo-gif docs, unused-import cleanup (#1211): no ops impact"
+  ],
+  "reviewed_unchanged": [
+    "MCP config validator allowlist (mcp_validator.py) and protected-files list — unchanged",
+    "Redis ACL / two-password model (#589) — unchanged",
+    "Non-root containers (#874) — unchanged"
   ]
 }
