@@ -1,29 +1,30 @@
 {
-  "last_commit": "2cd064e492ee15faaac1d0c43a1717979a11f7b4",
-  "last_sync_date": "2026-07-08",
+  "last_commit": "4d743fdb0bb3a846af29b3d28ab352944cf057f6",
+  "last_sync_date": "2026-07-28",
   "instance_used": "local (~/Dropbox/trinity/trinity on the dev branch)",
-  "baseline_before": "c6a2be5e2ccb86e6456a29bcf20195bf719b610f (main, v0.7.0 release)",
-  "commits_reviewed": 205,
-  "note": "Synced FROM DEV (user arg 'from dev'). dev has diverged from the v0.7.0 baseline (not an ancestor; merge-base a88f5fc8). Reviewed the ops-relevant delta c6a2be5..dev-HEAD. ~/trinity is still a stale April dev checkout (#554) and is NOT the canonical source — use ~/Dropbox/trinity/trinity. .env is absent in ops-public, so scripts/run.sh was not used; diffs were read directly from the local checkout.",
+  "baseline_before": "2cd064e492ee15faaac1d0c43a1717979a11f7b4 (previous sync point, 2026-07-08)",
+  "commits_reviewed": 221,
+  "note": "Range spans the v0.8.0 release (b3b7078b) and v0.8.5 prep (VERSION=0.8.5, 1571f63d). User arg: public repo — do not overly expose the enterprise side; enterprise-submodule features and ent#-tracked items documented only where they have an OSS ops surface, referenced by OSS PR numbers. .env absent in ops-public, so diffs were read directly from the local checkout (scripts/run.sh not used).",
   "changes_applied": [
-    "Env table (server): added ELEVENLABS_API_KEY/MODEL_ID/TTS_MAX_CHARS (#24/#25 outbound voice replies), REPORT_RATE_LIMIT (#918), WEBHOOK_RATE_LIMIT/IP_RATE_LIMIT/MAX_BODY_BYTES (#1023/#1424), REDELIVERY_GOVERNOR_ENABLED + 8 tuning vars (#1085), CREDENTIAL_ENCRYPTION_KEY_SECONDARY (#267), VITE_BUG_REPORTING_ENABLED/VITE_BUG_INTAKE_URL (#1116/#1489 build-time)",
-    "Docker socket GID CORRECTION (#1131): fixed the now-wrong 'Docker Desktop ignores group_add' claim in 4 places — Non-root #874 security note, 'Backend can't reach Docker socket' troubleshooting (heading de-Linux'd + container-probe command), DOCKER_GID env row, and the start.sh auto-gen sentence. Docker Desktop/Colima/Rancher/rootless present the socket as GID 0; start.sh now probes a throwaway container's socket GID",
-    "Service Architecture: added trinity-logs-init (#1478) one-shot alpine init that chowns /data/logs to 1000; backend depends_on it (service_completed_successfully)",
-    "Database Operations Key tables: added agent_reports (#918)",
-    "API Access: added Agent Reports endpoints (#918 — /api/agents/{name}/reports, /api/reports, /api/reports/stats) and public webhook trigger (POST /api/webhooks/{token}, #291/#1023/#1424)",
-    "Security Notes: NEW 'Credential Key Rotation (Issue #267)' subsection — rotate-credential-key.py --apply + CREDENTIAL_ENCRYPTION_KEY_SECONDARY two-key window, docs/migrations/CREDENTIAL_KEY_ROTATION.md"
+    "Env table: LOG_RETENTION_DAYS default corrected 90 → 5 (community floor #1065, seeded not clamped #1645); DO_NOT_TRACK row; TELEMETRY_SHARING_ENABLED/_URL/_INTERVAL_HOURS/_BACKFILL_DEFAULT_DAYS (#1723, opt-in + consent, kill switch); DISPATCH_BREAKER_ENABLED (#526/#1487 two-tier gate); REMINDER_* 6-var row (#1296); OPERATOR_QUEUE_* 14-cap row (#1632); PULL_MODE_PILOT_AGENTS/MAX_REDELIVERY (#1081); TRINITY_DEFAULT_SYSTEM_MANIFEST (#1764); ELEVENLABS row gains runtime-key note (PUT /api/settings/elevenlabs, #1549); OPERATOR_INTAKE row gains WARNING-on-non-2xx (#1678)",
+    "API Access: agent self-reminders list/cancel (#1296); per-agent MCP connector Expose-via-MCP status/enable/key (#1555/#1585); agent display label GET/PUT (#1642/#1676); retention windows + human-only acknowledge with {key, window_days} body (#1039/#1644/#1709); telemetry-sharing consent (#1723); proactive-rate-limits (#1609); git/freeze-schedules-if-failing (#1808); circuit-breaker block annotated with global-gate requirement (#1487/#1717) and autonomy decoupling (#1571)",
+    "Key tables: agent_reminders (#1296), product_events (#1721), enterprise_connectors (#1555, name kept for compat); agent_ownership row gains circuit_breaker_enabled, display_label (#1676), volume_base_name (#1666)",
+    "Service Architecture: trinity-vector row documents group_add 1000 (#1799) and the silent-write-failure mode under cap_drop ALL",
+    "Install section: start.sh --unattended / TRINITY_UNATTENDED=1 (#1708); first-run starter-fleet seed + disabled opt-out (#1764)",
+    "Troubleshooting: NEW 'Scheduled runs silently skipped while git sync is failing' (#1808/#1798/#1807); NEW 'Vector healthy but no log files written' (#1799, fixed v0.8.5); NEW 'Retention prune blocked / operator-queue alarm' (#1644/#1709 blast-radius guard, human-only ack)",
+    "PostgreSQL section: alembic wording updated — 0001_baseline + 30+ incremental revisions to head as of v0.8.5"
   ],
   "changes_skipped": [
-    "SSO/OIDC (#1303/#1447) + docker-compose.prod.enterprise.yml: live in the closed-source 'enterprise' git submodule (src/backend/enterprise). ops-public manages OSS Trinity — out of scope",
-    "Brain Orb (#58, routers/agent_brain_orb.py), Portal chat UI (#78), grid dashboard (#47), per-route titles/favicon (#1416/#1418), fork-to-own (#93), template-catalog curation (#1513), playbooks edit (#959), tasks-fill-height (#1500): frontend/UX, no ops surface",
-    "New agent-facing MCP tools report (#918), list_playbooks/run_playbook (#959): per existing convention agent-facing tools are not added to ops CLAUDE.md (the operator-facing HTTP endpoints were documented instead)",
-    "WhatsApp outbound media (#1315): messaging-adapter feature, no ops config",
-    "#1068 per-task timeout_seconds: unchanged from baseline (still deprecated-but-clamped, commit 762d7344 already in v0.7.0) — no edit"
+    "Enterprise-submodule / ent#-tracked features with no OSS ops surface, per user public-repo instruction: rooms + Sessions view (ent#169/#170), per-agent Slack bots + per-channel proactive consent + task report-back (ent#222/#223/#224), skill packages + skill-runner (ent#183/#139), ephemeral ghost agents detail (ent#69 — OSS columns exist in agent_ownership but feature not documented), Tier-1/Tier-2 telemetry framing (documented neutrally as opt-in sharing), SSO/OIDC",
+    "Per-user GitHub PAT endpoints (GET/PUT/DELETE /api/users/me/github-pat, #1686) + managed PAT for gh CLI (#1591) + PAT-free public-template clone: user self-service, not ops surface",
+    "helper-mcp standalone docs Q&A server (#1459): not part of the deployed stack",
+    "POST /api/product-events endpoint: frontend-internal capture path (table documented instead)",
+    "Loops failure policy columns (#1167), agent .git maintenance/gc internals (#1595/#1596), MCP-key revocation on delete (#1745), volume purge leak fix (#1583), SSH ephemeral-key hardening (#1615/#1616): behavior fixes with no operator action needed",
+    "Model catalog additions (Fable 5 / Sonnet 5, #1660) and context-window denominators (#1521): product behavior, no ops surface"
   ],
   "reviewed_unchanged": [
-    "MCP config validator allowlist + protected-files list — unchanged",
-    "Redis ACL / two-password model (#589) — unchanged",
-    "Only ONE new DB table since baseline (agent_reports); webhooks/playbooks add no tables",
-    "Trust model & prompt-injection boundary (#1523) — already present in working tree from a prior edit"
+    "migrate-to-postgres skill: schema comes from Trinity's own code (init_schema_postgres / alembic), so the 3 new tables need no skill edit; ETL orphan-table handling already covers them",
+    "rebuild-agent skill: services.agent_service.lifecycle.recreate_container_with_updated_config still exists at the documented path after the #1484 decomposition and #1809/#1811 recovery fixes",
+    "Redis ACL model (#589), MCP validator allowlist, protected-files list, healthcheck relaxation (#1230), AGENT_AUTH_SECRET guidance (#1159): all unchanged"
   ]
 }

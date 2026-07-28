@@ -250,7 +250,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 curl -s -H "Authorization: Bearer $TOKEN" \
   http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/analytics | jq
 
-# Per-agent dispatch circuit breaker (#526) — view + configure
+# Per-agent dispatch circuit breaker (#526) — view + configure. Two-tier gate
+# (#1487/#1717): the global DISPATCH_BREAKER_ENABLED env must ALSO be true
+# (default false) or this per-agent toggle no-ops. Breaker state no longer
+# blocks agent autonomy features (#1571).
 curl -s -H "Authorization: Bearer $TOKEN" \
   http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/circuit-breaker | jq
 curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
@@ -294,6 +297,45 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 curl -s -X POST -H 'Content-Type: application/json' \
   http://$HOST:${BACKEND_PORT:-8000}/api/webhooks/<webhook_token> \
   -d '{"message": "run now"}'
+
+# Agent self-reminders (#1296) — one-shot deferred self-triggers set by the
+# agent's `set_reminder` MCP tool; operators list and cancel. Caps via REMINDER_* env
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/reminders | jq
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/reminders/<reminder_id>/cancel | jq
+
+# Per-agent MCP connector "Expose via MCP" (#1555) — publish an agent's playbooks
+# as MCP tools to external clients; status, enable, mint/revoke connector key.
+# One-click "Copy connection config" also available in the UI panel (#1585).
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/connector | jq
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/connector/key | jq   # returns the secret ONCE
+
+# Agent display label (#1642/#1676) — human-facing name; the slug (agent_name)
+# stays immutable so container/volume/API identity never moves
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/label -d '{"label": "My Agent"}' | jq
+
+# Effective data-retention windows + approve an over-threshold prune (#1039/#1644/#1709)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/settings/retention | jq
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  http://$HOST:${BACKEND_PORT:-8000}/api/settings/retention/acknowledge \
+  -d '{"key": "<sweep_key>", "window_days": <days>}' | jq   # human-only; agent-scoped keys rejected. 409 unless window_days matches the window in force
+
+# Fleet telemetry-sharing consent (#1723) — opt-in aggregate sharing; default off
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/settings/telemetry-sharing | jq
+
+# Proactive-message rate limits (#1609) — admin-tunable channel send caps
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/settings/proactive-rate-limits | jq
+
+# Per-agent schedule freeze while git sync is failing (#1808) — view + toggle
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/git/freeze-schedules-if-failing | jq
 ```
 
 ---
@@ -317,7 +359,7 @@ Key tables:
 
 | Table | Purpose |
 |-------|---------|
-| `agent_ownership` | Agent registry + per-agent flags (`file_sharing_enabled`, `deleted_at` for soft-delete) |
+| `agent_ownership` | Agent registry + per-agent flags (`file_sharing_enabled`, `deleted_at` for soft-delete, `circuit_breaker_enabled` #526, `display_label` #1676 — human-facing name over the immutable slug, `volume_base_name` #1666 — data-volume identity frozen at rename) |
 | `agent_schedules` | Cron schedules + `deleted_at` for soft-delete (#834) |
 | `agent_shared_files` | Outbound file shares — token-scoped download URLs with expiry |
 | `agent_sessions` / `agent_session_messages` | Session Tab persistent chat (SESSION_TAB_2026-04, feature-gated) |
@@ -332,6 +374,9 @@ Key tables:
 | `public_user_memory` | Per-user memory written by `write_user_memory` MCP tool (MEM-001 / #888) |
 | `public_chat_sessions` / `public_chat_messages` | Public-link chat sessions |
 | `slack_channels` | Slack workspace↔agent bindings + DM default routing |
+| `agent_reminders` | Agent self-reminders (#1296) — one-shot deferred self-triggers set via the `set_reminder` MCP tool; listed/cancelled via `/api/agents/{name}/reminders` |
+| `product_events` | Local product-event capture (#1721) — activation-funnel events; stays on-instance unless telemetry sharing is explicitly enabled |
+| `enterprise_connectors` | Per-agent MCP connector state (#1555, "Expose via MCP") — enabled flag + exposed playbooks; table name kept for compatibility |
 
 **Soft-delete (#834):** `agent_ownership` and `agent_schedules` have `deleted_at` columns; rows aren't physically removed on delete. Retention sweep purges rows past TTL. Use `/api/admin/soft-deleted/*` to list and recover.
 
@@ -404,7 +449,9 @@ Everything else (`SECRET_KEY`, `CREDENTIAL_ENCRYPTION_KEY`, `INTERNAL_API_SECRET
 curl http://localhost:8000/health
 ```
 
-On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you to set your admin password and configure API keys.
+**Unattended install (#1708):** `./scripts/deploy/start.sh --unattended` (or `TRINITY_UNATTENDED=1`) removes the interactive hard-stops — a missing `ADMIN_PASSWORD` is auto-generated and printed in the end-of-run summary instead of blocking on a prompt. Use for scripted/agent-driven installs.
+
+On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you to set your admin password and configure API keys. After first-time setup, a genuinely fresh install auto-deploys a bundled starter fleet once (#1764); set `TRINITY_DEFAULT_SYSTEM_MANIFEST=disabled` beforehand to skip it, or point it at your own manifest file.
 
 ---
 
@@ -417,7 +464,7 @@ On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you 
 | `trinity-mcp-server` | 8080:8080 | MCP Protocol Server |
 | `trinity-scheduler` | 8001:8001 | Scheduled tasks — runs as UID 1000 |
 | `trinity-redis` | 6379:6379 | Sessions, credentials, WS auth tickets — ACL-protected, two users (#589) |
-| `trinity-vector` | 8686:8686 | Log aggregation |
+| `trinity-vector` | 8686:8686 | Log aggregation — runs as root but joins GID 1000 via `group_add` (#1799) so its file sink can write the UID-1000-owned `/data/logs`; `cap_drop: ALL` strips `CAP_DAC_OVERRIDE`, so without the group root's writes fail *silently* (healthcheck stays green) |
 | `trinity-logs-init` | — | One-shot `alpine` init (#1478): `chown 1000:1000 /data/logs` so UID-1000 Vector retention can write. Backend `depends_on` it (`service_completed_successfully`); exits immediately, `restart: no` |
 | `trinity-postgres` | 5432:5432 | **Optional** PostgreSQL backend (#300) — dev-compose only, behind `--profile postgres`. Off by default (SQLite). See [Database Backend](#database-backend-sqlite-default--postgresql-300). |
 | `agent-{name}` | — | Per-agent isolated containers |
@@ -444,7 +491,7 @@ Both the backend and the standalone scheduler read the same `DATABASE_URL`, so t
 - **Dev `docker-compose.yml`** bundles a `postgres:16-alpine` service (container `trinity-postgres`) gated behind the `postgres` **compose profile**. Enable with `POSTGRES_PASSWORD` set, then `docker compose --profile postgres up -d`.
 - **Prod `docker-compose.prod.yml` ships NO postgres service.** A `postgresql://` URL in prod must point at an **operator-managed** PostgreSQL (RDS, Cloud SQL, a separate VM). The backend/scheduler/agent containers must be able to reach that host:port.
 
-**On first (cold) start** against an empty Postgres, the backend runs `alembic upgrade head` — the `0001_baseline` revision builds all ~61 tables plus append-only audit-log triggers, then seeds the admin user from `ADMIN_PASSWORD`. The instance starts in first-run setup (`setup_required` on login is expected, not an error). Alembic owns the PG schema; **SQLite keeps its separate `db/migrations.py` runner** — the two coexist during the transition.
+**On first (cold) start** against an empty Postgres, the backend runs `alembic upgrade head` — the `0001_baseline` revision builds the ~61 base tables plus append-only audit-log triggers, the incremental revisions on top of it (30+ as of v0.8.5, e.g. `agent_reminders`, `product_events`) bring the schema to head, then the admin user is seeded from `ADMIN_PASSWORD`. The instance starts in first-run setup (`setup_required` on login is expected, not an error). Alembic owns the PG schema; **SQLite keeps its separate `db/migrations.py` runner** — the two coexist during the transition.
 
 **Migrating an existing SQLite instance:** upstream's `init_database()` only *bootstraps* a fresh PG DB — it has no SQLite→PG data copy. This ops agent ships the **`/migrate-to-postgres`** skill (`.claude/skills/migrate-to-postgres/`) to close that gap: it stands up Postgres alongside the running instance, trial-copies + validates the data via a dialect-aware ETL, then cuts over in a short downtime window with one-line rollback (the SQLite file is never written). Gated at every state-changing step.
 
@@ -614,6 +661,33 @@ Issue #874 / #1131 — backend runs as UID 1000 and joins the socket's group via
 
 Re-run `start.sh` to auto-detect (it probes the container's socket GID), or set `DOCKER_GID=<gid>` manually and `docker compose up -d` again.
 
+### Scheduled runs silently skipped while git sync is failing
+
+Issue #1808 — the per-agent `freeze_schedules_if_sync_failing` flag is now actually enforced: when an agent's git sync is red and the flag is on, the scheduler pauses that agent's scheduled executions (previously the flag existed but did nothing). The hold is surfaced in the Schedules tab (#1798) and in reminder dispatch (#1807). If an agent's schedules stop firing:
+
+```bash
+# Is the freeze flag on, and is sync actually failing?
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/git/freeze-schedules-if-failing | jq
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/git/status | jq
+```
+
+Fix the sync failure (or toggle the flag off via `PUT` on the same endpoint) and schedules resume.
+
+### Vector healthy but no log files written
+
+Issue #1799 — `/data/logs` is chowned to 1000:1000 mode 775 (#1478), and Vector's `cap_drop: ALL` strips `CAP_DAC_OVERRIDE` — the capability that lets root ignore file permissions. Root-run Vector then falls through to "other" (`r-x`) and **every file-sink write fails silently**: sink errors don't fail the `:8686` healthcheck, so the container reports healthy while writing nothing. Fixed by adding `group_add: ["1000"]` to the Vector service (v0.8.5). If `/data/logs` is empty on an older deployment:
+
+```bash
+./scripts/run.sh "sudo docker logs trinity-vector --tail 50 2>&1 | grep -i 'permission denied'"
+# Fix: update Trinity (v0.8.5+), or add group_add: ["1000"] to the vector service and re-up
+```
+
+### Retention prune blocked / operator-queue alarm about a mass deletion
+
+Issue #1644/#1709 — the retention sweep refuses a prune that would delete most of a table (blast-radius guard, e.g. after a retention window was accidentally shrunk). The guard raises an informational operator-queue alarm, but responding to that alarm authorizes nothing — the only gate is `POST /api/settings/retention/acknowledge` (see API Access), which is **human-only** (agent-scoped MCP keys are rejected even with admin role), single-use, and bound to the exact `window_days` in force. Check effective windows first with `GET /api/settings/retention`; widen the window if the shrink was accidental, or acknowledge to let the prune run once.
+
 ### Long-running agent task killed at 60min
 
 Default execution timeout was bumped 15min → 60min (#665). The deadline is now the **per-agent** `execution_timeout_seconds` (clamped by the schedule cap, #929) — the scheduler honors it (#913 / #922). The old **per-task `timeout_seconds` override is deprecated** (#1068): still honored-but-clamped this release, removed in a follow-up. To extend the wall, raise the agent's `execution_timeout_seconds` (Agent Detail → Settings, or `PATCH /api/agents/{name}`) rather than passing a per-task override.
@@ -712,7 +786,7 @@ TRINITY=${TRINITY_PATH:-~/trinity}
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` | For SMTP email | When `EMAIL_PROVIDER=smtp` (#771) |
 | `SENDGRID_API_KEY` | For SendGrid email | When `EMAIL_PROVIDER=sendgrid` (#771) |
 | `SLACK_SOCKET_CONNECTION_COUNT` | Optional | Concurrent Slack Socket Mode connections (default 2, range 1–10) |
-| `LOG_RETENTION_DAYS` | Optional | Days to keep Vector logs (default 90) |
+| `LOG_RETENTION_DAYS` | Optional | Days to keep Vector logs (default **5** since v0.8.5 — community retention floor #1065; was 90). The floor is applied by *seeding* fresh installs, not clamping (#1645) — existing configured values are preserved, and any admin may widen windows. Check effective windows: `GET /api/settings/retention` |
 | `LOG_ARCHIVE_ENABLED` | Optional | Compress to `/data/archives` instead of delete (default true) |
 | `LOG_CLEANUP_HOUR` | Optional | UTC hour for daily cleanup job (default 3) |
 | `CANARY_ENABLED` | Staging/dev | Run 5-min invariant watcher loop (default 0) |
@@ -733,14 +807,21 @@ TRINITY=${TRINITY_PATH:-~/trinity}
 | `TELEMETRY_CONTAINER_STATS_TTL` / `TELEMETRY_DOCKER_POOL_SIZE` | Optional (#1096) | `/api/telemetry/containers` cache freshness in s (10) / max concurrent Docker stat fetches (16) |
 | `AGENT_TMP_SIZE` | Optional (#1231) | Size of each agent container's `/tmp` RAM-backed tmpfs (e.g. `512m`, `2g`; default `512m`). `noexec,nosuid` always applied; counts against the agent memory cgroup. Picked up on recreate, not restart |
 | `MCP_AGENT_CHAT_PULL_ENABLED` | Optional (#946, default false) | Pull-pilot experiment — routes sequential agent→agent `chat_with_agent` through the durable async `/task` path instead of sync `/chat`. Read by BOTH mcp-server (the gate) and backend (observability) from this one key |
-| `OPERATOR_INTAKE_ENABLED` / `OPERATOR_INTAKE_URL` | Optional (default true / `intake.abilityai.dev`) | First-run **opt-in**: on the operator's explicit consent, their email + company are submitted ONCE to a hosted Ability.ai intake endpoint (fire-and-forget; a blocked POST never breaks setup). Honors `DO_NOT_TRACK=1`; set false for air-gapped/privacy-strict installs |
+| `OPERATOR_INTAKE_ENABLED` / `OPERATOR_INTAKE_URL` | Optional (default true / `intake.abilityai.dev`) | First-run **opt-in**: on the operator's explicit consent, their email + company are submitted ONCE to a hosted Ability.ai intake endpoint (fire-and-forget; a blocked POST never breaks setup). Honors `DO_NOT_TRACK`; set false for air-gapped/privacy-strict installs. Non-2xx delivery now logged at WARNING (#1678) |
+| `DO_NOT_TRACK` | Optional (default 0) | Cross-tool convention (consoledonottrack.com): ANY value other than 0/empty/false disables both the operator-intake POST and fleet telemetry sharing — the one-var air-gap/privacy switch |
+| `TELEMETRY_SHARING_ENABLED` (+ `TELEMETRY_SHARING_URL`, `TELEMETRY_SHARING_INTERVAL_HOURS`, `TELEMETRY_SHARING_BACKFILL_DEFAULT_DAYS`) | Optional (#1723) | **Opt-in** fleet telemetry sharing: anonymized aggregate counts egress ONLY after explicit admin consent in Settings (default off) AND this flag. `false` (or `DO_NOT_TRACK`) is the hard kill switch — the consent toggle then 409s. Consent state: `GET/PUT /api/settings/telemetry-sharing`. Defaults: hosted intake URL / 24h heartbeat / 30-day backfill window |
 | `AGENT_DATA_EXPORT_MAX_BYTES` / `AGENT_DATA_INLINE_MAX_BYTES` | Optional (#1169) | Caps for agent runtime-data export/import (default 5 GB / 10 MB). Export 413s on overflow |
-| `ELEVENLABS_API_KEY` / `ELEVENLABS_MODEL_ID` / `TTS_MAX_CHARS` | Optional (#24/#25) | Outbound voice replies across channels (Telegram, etc.). Empty key = feature off (adapters deliver text). `ELEVENLABS_MODEL_ID` defaults `eleven_multilingual_v2` — leave non-empty (#1076); `TTS_MAX_CHARS` (1500) delivers longer replies as text to cap synth cost |
+| `ELEVENLABS_API_KEY` / `ELEVENLABS_MODEL_ID` / `TTS_MAX_CHARS` | Optional (#24/#25) | Outbound voice replies across channels (Telegram, etc.). Empty key = feature off (adapters deliver text). `ELEVENLABS_MODEL_ID` defaults `eleven_multilingual_v2` — leave non-empty (#1076); `TTS_MAX_CHARS` (1500) delivers longer replies as text to cap synth cost. Since #1549 the key can also be set at runtime via `PUT /api/settings/elevenlabs` (no restart), with per-agent voice config and per-channel allow flags |
 | `REPORT_RATE_LIMIT` | Optional (#918) | Max structured reports an agent may create per 60s window (default 30). Backs the `report` MCP tool / `agent_reports` table |
 | `WEBHOOK_RATE_LIMIT` / `WEBHOOK_IP_RATE_LIMIT` / `WEBHOOK_MAX_BODY_BYTES` | Optional (#1023/#1424) | Public webhook-trigger hardening: triggers per token/60s (10), pre-auth requests per IP/60s (60, unknown-token flood guard), request-body cap in bytes (16384 → 413). Windows fixed in code. Guards `POST /api/webhooks/{token}` |
 | `REDELIVERY_GOVERNOR_ENABLED` (+ `REDELIVERY_FLEET_LIMIT`/`_WINDOW_SECONDS`, `REDELIVERY_AGENT_LIMIT`/`_WINDOW_SECONDS`, `CORRELATED_FAILURE_THRESHOLD`/`_WINDOW_SECONDS`, `CORRELATED_PAUSE_TTL_SECONDS`, `REDELIVERY_PAUSE_RETRY_AFTER_SECONDS`) | Optional (#1085) | Backend re-delivery rate caps + shared-cause (AUTH/BILLING) fleet pause on the #1083 fire-and-forget callback path. Default **OFF**; fail-open (a Redis blip degrades to allow, never block/drop); Redis-only state, no schema change. Flipping back to false is the whole rollback |
 | `CREDENTIAL_ENCRYPTION_KEY_SECONDARY` | Optional (#267) | Decrypt-only fallback used ONLY during credential-key rotation — set to the PREVIOUS key while `CREDENTIAL_ENCRYPTION_KEY` holds the new one, run `rotate-credential-key.py --apply`, then remove. Empty in normal operation. See [Credential Key Rotation](#credential-key-rotation-issue-267) |
 | `VITE_BUG_REPORTING_ENABLED` / `VITE_BUG_INTAKE_URL` | Optional (#1116/#1489) | Frontend **build-time** (baked into the world-readable client bundle — rebuild the frontend image to apply; never put a secret in a `VITE_*` var). In-app bug/feedback widget on/off (default true) and its intake endpoint (default `intake.abilityai.dev`). Repointing the URL also needs a CSP `connect-src` change (nginx + vite config) |
+| `DISPATCH_BREAKER_ENABLED` | Optional (#526/#1487, default false) | GLOBAL gate for the per-agent dispatch circuit breaker that fast-fails NEW executions (503) when an agent is auth-dead instead of poisoning the backlog. Two-tier: this flag AND the per-agent toggle (`PUT /api/agents/{name}/circuit-breaker`) must BOTH be on — with this off, the per-agent toggle no-ops |
+| `REMINDER_MESSAGE_MAX_CHARS` / `REMINDER_MIN_DELAY_SECONDS` / `REMINDER_MAX_DELAY_SECONDS` / `MAX_PENDING_REMINDERS_PER_AGENT` / `MAX_REMINDERS_PER_AGENT_PER_DAY` / `REMINDER_RATE_LIMIT` | Optional (#1296) | Agent self-reminder caps: message 4000 chars, fire window 60s–30d, 25 pending + 100/day per agent, 30 `set_reminder` calls/agent/60s. All have working code defaults |
+| `OPERATOR_QUEUE_*` (14 caps: `_MAX_PENDING_PER_AGENT`, `_CREATE_RATE_LIMIT`/`_WINDOW`, `_FLEET_CREATE_RATE_LIMIT`, `_MAX_SCAN_PER_CYCLE`, `_MAX_FILE_BYTES`, `_TITLE_MAX`, `_QUESTION_MAX`, `_CONTEXT_MAX_BYTES`, `_OPTIONS_MAX_BYTES`, `_ID_MAX`, `_EXECUTION_ID_MAX`, `_FLOOD_ALERT_COOLDOWN_SECONDS`) | Optional (#1632) | Ingestion caps bounding a compromised/runaway agent flooding `~/.trinity/operator-queue.json` — depth (25 pending/agent), rate (60/agent + 300/fleet per 60s), file-size (2 MB skip), field-size truncation, one flood alert per agent per 5 min. Generous by design: cap abuse, not use |
+| `PULL_MODE_PILOT_AGENTS` / `MAX_REDELIVERY` | Optional (#1081, default empty / 3) | Pull/work-stealing pilot (dark by default): comma-separated agent names opted into the agent-side pull worker pool. Backend-only process-env — needs a backend restart AND the agent recreated to engage. `MAX_REDELIVERY` = re-deliveries of an expired pull lease before the row is poison-parked to the operator queue |
+| `TRINITY_DEFAULT_SYSTEM_MANIFEST` | Optional (#1764, default empty) | First-run starter-fleet seed: on a genuinely fresh install, Trinity auto-deploys the bundled `config/manifests/default-system.yaml` once after setup. Set to a path (bind-mounted into the backend) for a custom manifest, or `disabled` to skip seeding |
 
 ---
 
