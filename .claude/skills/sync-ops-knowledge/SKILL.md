@@ -46,6 +46,13 @@ cat .claude/skills/sync-ops-knowledge/last-sync.json 2>/dev/null || echo '{"last
 
 ### Step 2: Gather Recent Changes from Trinity Codebase
 
+**Source selection.** This repo has no `.env` when it is used purely as a docs/skills repo, and the Trinity source of truth may be a local checkout rather than a deployed instance. Resolve in this order, and record which was used in `last-sync.json`:
+
+1. A local Trinity checkout (e.g. `~/Dropbox/trinity/trinity`) — read diffs directly with `git -C <path>`, no `scripts/run.sh`. Confirm the branch first (`git branch --show-current`): a `from dev` argument means the **dev** branch, which is ahead of the deployed instance.
+2. `.env` + `scripts/run.sh` against the configured instance.
+
+Verify the recorded `last_commit` is still an ancestor of HEAD before diffing (`git merge-base --is-ancestor <last_commit> HEAD`) — a force-push or branch switch invalidates the range and the review must fall back to `--since N days`.
+
 SSH into the instance and collect git history:
 
 ```bash

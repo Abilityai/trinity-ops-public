@@ -50,6 +50,16 @@ else
   ./scripts/run.sh "sudo docker inspect agent-$AGENTS" >/dev/null 2>&1 || { echo "ABORT: agent-$AGENTS not found"; exit 1; }
 fi
 echo "Targets: $AGENTS"
+
+# Record which targets are currently STOPPED. `docker ps -a` includes them, and
+# a stopped agent is a deliberate operator state that a rebuild must not undo
+# (abilityai/trinity#2092: an adoption wave here silently restarted two agents
+# stopped eight days earlier — autonomy_enabled=0 does NOT gate inbound chat, so
+# a channel binding and a public link became reachable again).
+for AGENT in $AGENTS; do
+  STATE=$(./scripts/run.sh "sudo docker inspect agent-$AGENT --format '{{.State.Status}}'" | tr -d '[:space:]')
+  [ "$STATE" != "running" ] && echo "NOTE: $AGENT is '$STATE' — will be rebuilt and left stopped"
+done
 ```
 
 ### 4. Refuse if Agents Have Running Executions
@@ -96,9 +106,24 @@ else:
 old_image_tag = old.attrs.get('Config', {}).get('Image', 'unknown')
 print(f'Recreating {name} (owner={owner}, old tag={old_image_tag})')
 
-new = asyncio.run(recreate_container_with_updated_config(name, old, owner))
+# #2092: recreate STARTS the replacement. Preserve the original run state
+# instead — require_running=False permits a stopped target, and
+# preserve_run_state=True stops the replacement again right after handoff.
+# Both kwargs exist from Trinity #2155; older backends take neither, so fall
+# back and refuse a stopped target rather than silently starting it.
+was_running = old.status == 'running'
+try:
+    new = asyncio.run(recreate_container_with_updated_config(
+        name, old, owner, require_running=False, preserve_run_state=True))
+except TypeError:
+    if not was_running:
+        raise SystemExit(
+            f'ABORT: {name} is {old.status!r} and this Trinity predates #2155 '
+            '(no preserve_run_state) — recreating it would START it. '
+            'Start it deliberately, or update Trinity.')
+    new = asyncio.run(recreate_container_with_updated_config(name, old, owner))
 new.reload()
-print(f'OK: {new.short_id} status={new.status}')
+print(f'OK: {new.short_id} status={new.status} (was_running={was_running})')
 \""
 done
 ```
@@ -115,9 +140,14 @@ done
 
 ### 7. Report
 
-Summary table: agent / status. Flag any not in `running` state.
+Summary table: agent / status **before** / status **after**. A rebuild must not
+change run state: flag any agent whose before/after differ — a previously-running
+agent now stopped is a failed rebuild, and a previously-stopped agent now running
+means `preserve_run_state` did not take effect.
 
 ## Failure Handling
 
 - **Pre-flight fails**: nothing touched. Fix the named problem and re-run.
 - **Mid-recreate failure**: workspace volume is preserved. Re-run `/rebuild-agent <name>` — recreate reads config from DB even without the old container.
+- **`ValueError: ... would START agent ...`**: the target is stopped and the call did not pass `require_running=False` (Trinity #2092). Step 5 passes it; seeing this means an edited/older copy of the step is running.
+- **Agent stopped before, running after**: `preserve_run_state` was not honored. Stop it again immediately (`sudo docker stop agent-<name>`) — a stopped agent still answers inbound chat, channel bindings and public links once it is up; `autonomy_enabled=0` does not gate those.
