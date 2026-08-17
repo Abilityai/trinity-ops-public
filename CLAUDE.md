@@ -85,18 +85,53 @@ Pulls the latest code, rebuilds Docker images, restarts services, and verifies h
 ./scripts/update.sh
 ```
 
+**v0.9.0 upgrade notes (#1814 / #1809 / #1860 / #1816):** `start.sh` never rebuilds platform images, so an in-place `git pull` leaves the *previous* build running the *new* code. `update.sh` rebuilds the four platform images for you; check `GET /api/version` afterwards — `version` is the code in service, `image_version` the build it runs inside, and **if they differ the image is stale**. The agent **base image** is separate: when `docker/base-image/` changed in the pulled range, run `./scripts/deploy/build-base-image.sh` on the server, then **stop and start** each agent (or Operating Room → Restart All / `/rebuild-agent`). Since v0.9.0 a cold stop/start detects the rebuilt image and recreates the container itself (`recreate_reason: "image_drift"`); a start of an already-*running* agent never image-recreates it. `update.sh` prints a reminder when the pulled range touched the base image.
+
 ### Backup Database
+
+**Trinity backs up its own database since v0.9.0 (#2216)** — nightly at **03:30 UTC**, both backends, default ON, zero setup:
+
+| What | Value |
+|------|-------|
+| Where | `/data/backups/` in the backend container — `trinity_trinity-data` volume (dev) or `${TRINITY_DATA_PATH}/backups` (prod bind mount) |
+| SQLite | `trinity-backup-YYYYMMDD.db` — consistent online copy via SQLite's backup API, `PRAGMA quick_check`-verified before it is kept |
+| PostgreSQL | `trinity-backup-YYYYMMDD.dump` — `pg_dump -Fc` (the backend image now bakes `postgresql-client-17`; restore with `pg_restore`) |
+| Pre-migration | `pre-migration-YYYYMMDD-HHMMSS.db` — extra boot-time copy taken automatically when a schema migration is about to run (SQLite) |
+| Retention | ops setting `backup_retention_days` (default **14**, bounds 1–3650; `0` is *rejected*) via `PUT /api/settings/ops/config`; the newest **3** artifacts are always kept |
+| Disable | `DB_BACKUP_ENABLED=false` (turns off the nightly job AND the boot pre-migration copy) |
+| Failure visibility | A failed/skipped run raises an operator-queue item under the platform sentinel `_db-backup`; a "backups stale" alarm re-fires weekly while the newest success is > 3 days old |
+| Scope | **Same-disk** — protects against corruption, a bad migration, a fat-fingered delete; **not** disk/host loss. Ship `/data/backups/` off-host (rsync/cron after 03:30 UTC, or disk snapshots) for DR |
+
+```bash
+# Backup status — last run, last success + age, artifact count/bytes, scope
+curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api/settings/retention | jq .backup
+
+# List the artifacts on the host
+./scripts/run.sh "sudo docker exec trinity-backend ls -lh /data/backups/"
+```
+
+**Manual on-demand backup** (before something unusually risky):
 
 ```bash
 ./scripts/backup.sh
-# Saves to /tmp/trinity-<timestamp>.db on the host
+# Saves ~/backups/trinity-<timestamp>.db on the host (SQLite, via sqlite3 .backup)
+# or ~/backups/trinity-pg-<timestamp>.dump when the instance runs the bundled PostgreSQL
 ```
 
-`backup.sh` copies the SQLite file. **If the instance runs on PostgreSQL** (`DATABASE_URL` set — see [Database Backend](#database-backend-sqlite-default--postgresql-300)), back up with `pg_dump` instead:
+`backup.sh` uses the SQLite online-backup API — **never `cp` a live `trinity.db`** (a raw copy mid-write, ignoring its journal, can be torn or stale). On a **managed/external PostgreSQL** (`DATABASE_URL` pointing off-box) use your provider's snapshot tooling or `pg_dump -Fc` against the host.
+
+Also back up **`~/trinity/.env` manually** — it holds `CREDENTIAL_ENCRYPTION_KEY`; a database artifact alone does not cover it.
+
+**Restore (SQLite)** — stop **both** DB writers, remove stale journal sidecars, copy the artifact in, start:
 
 ```bash
-./scripts/run.sh "sudo docker exec trinity-postgres pg_dump -U \${POSTGRES_USER:-trinity} trinity" > trinity-pg-backup.sql
+./scripts/run.sh "cd ${TRINITY_PATH:-~/trinity} && sudo docker compose -f ${COMPOSE_FILE:-docker-compose.prod.yml} stop backend scheduler"
+./scripts/run.sh "sudo docker run --rm -v trinity_trinity-data:/data -v ~/backups:/backup alpine sh -c 'rm -f /data/trinity.db-wal /data/trinity.db-shm /data/trinity.db-journal && cp /backup/<artifact>.db /data/trinity.db && chown 1000:1000 /data/trinity.db'"
+#   (prod bind mount: -v ${TRINITY_DATA_PATH}:/data; an automatic artifact is already inside the volume at /data/backups/<artifact>.db)
+./scripts/run.sh "cd ${TRINITY_PATH:-~/trinity} && sudo docker compose -f ${COMPOSE_FILE:-docker-compose.prod.yml} start backend scheduler"
 ```
+
+`/rollback [commit] [backup]` runs this sequence for you. **PostgreSQL:** `pg_restore` the `.dump` into an empty database with backend+scheduler stopped, then point `DATABASE_URL` at it.
 
 ### Tunnel (remote only)
 
@@ -231,6 +266,17 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   http://$HOST:${BACKEND_PORT:-8000}/api/canary/violations | jq
 curl -s -X POST -H "Authorization: Bearer $TOKEN" \
   http://$HOST:${BACKEND_PORT:-8000}/api/canary/run-cycle | jq    # manual cycle trigger
+# Canary RUN-STATE (#2217) — zero violations from a harness that is OFF is
+# byte-identical to a clean fleet; this answers enabled / last cycle / sink.
+# status = disabled | ok | stale | unknown (fail-open: never `stale` when off).
+# Public feature flags also carry a `canary_enabled` boolean for any authed user.
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/canary/status | jq
+
+# Version in service vs. image built (#1810/#1814) — `version` is the code
+# executing, `image_version` the build it runs inside; DIFFERENT = stale image,
+# rebuild the platform images (see Update Trinity)
+curl -s http://$HOST:${BACKEND_PORT:-8000}/api/version | jq '{version, image_version, git_commit_short, edition}'
 
 # Admin recovery for soft-deleted agents/schedules (#834)
 curl -s -H "Authorization: Bearer $TOKEN" \
@@ -242,8 +288,9 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 curl -s http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/a2a/agent-card | jq
 
 # Session Tab — start session, list, message, reset (#685, feature-gated).
-# Being ABSORBED into Workspace (#2120): the endpoints still exist and still work,
-# but the Session surface now lives inside Workspace chats with continuity parity.
+# ABSORBED into Workspace in v0.9.0 (#2120 / ent#358; the Sessions page and its
+# nav entry are retired, ent#381): the endpoints still exist and still work, but
+# the surface lives inside Workspace chats (`?tab=session` redirects to /workspace).
 curl -s -X POST -H "Authorization: Bearer $TOKEN" \
   http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/session | jq
 
@@ -326,11 +373,22 @@ curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/j
   http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/label -d '{"label": "My Agent"}' | jq
 
 # Effective data-retention windows + approve an over-threshold prune (#1039/#1644/#1709)
+# Since v0.9.0 the response also carries `backup` (the #2216 automatic-backup status
+# block) and `blocked_sweeps` (#2146: sweeps the guard refuses for a NON-approvable
+# reason — count_uninterpretable / count_negative / ack_lookup_failed — which used
+# to render as a clean "nothing pending"). `pending_acknowledgements` stays the
+# approvable list.
 curl -s -H "Authorization: Bearer $TOKEN" \
   http://$HOST:${BACKEND_PORT:-8000}/api/settings/retention | jq
 curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   http://$HOST:${BACKEND_PORT:-8000}/api/settings/retention/acknowledge \
   -d '{"key": "<sweep_key>", "window_days": <days>}' | jq   # human-only; agent-scoped keys rejected. 409 unless window_days matches the window in force
+# Ops settings incl. the row-retention windows and `backup_retention_days` (#2216;
+# 1-3650, `0` REJECTED — disabling backups is DB_BACKUP_ENABLED=false, never keep-forever)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/settings/ops/config | jq
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  http://$HOST:${BACKEND_PORT:-8000}/api/settings/ops/config -d '{"backup_retention_days": 30}' | jq
 
 # Fleet telemetry-sharing consent (#1723) — opt-in aggregate sharing; default off
 curl -s -H "Authorization: Bearer $TOKEN" \
@@ -367,7 +425,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 curl -s -H "Authorization: Bearer $TOKEN" \
   "http://$HOST:${BACKEND_PORT:-8000}/api/executions/timeline?group_by=day&hours=168" | jq
 #   group_by = hour | day | trigger | agent · hours = rolling window (default 168)
-#   &agent=myagent to scope to one agent
+#   &agent=myagent to scope to one agent · &split=trigger (ent#96, v0.9.0) adds a
+#   second dimension over a TIME grouping only (hour|day) — 422 on trigger/agent
 
 # A2A INBOUND server (#1628) — Trinity serves the A2A protocol so EXTERNAL agents
 # can task yours. PUBLIC, no auth, but per-agent opt-in: nothing is served unless
@@ -435,7 +494,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 curl -s -H "Authorization: Bearer $TOKEN" \
   http://$HOST:${BACKEND_PORT:-8000}/api/evaluations | jq              # fleet-wide
 
-# Workspace / client portal (#2084) — OSS core since v0.9.0-dev (it was an entitled
+# Workspace / client portal (#2084) — OSS core since v0.9.0 (it was an entitled
 # enterprise module). Route prefix stays /api/enterprise/client-portal for
 # compatibility with existing API-only integrations; it is NOT edition-gated.
 # Clients sign in with a verified email and no platform account.
@@ -584,13 +643,14 @@ On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you 
 
 | Container | Port (host:container) | Purpose |
 |-----------|----------------------|---------|
-| `trinity-backend` | 8000:8000 | FastAPI REST API — runs as UID 1000 (#874) |
+| `trinity-backend` | 8000:8000 | FastAPI REST API — runs as UID 1000 (#874). Image bakes `postgresql-client-17` since v0.9.0 (#2216) for the nightly `pg_dump` arm — major-pinned so an unrelated rebuild can never move it; a PG server major above 17 fails the backup **loudly** (operator alarm), never silently |
 | `trinity-frontend` | 80:8080 | Vue.js Web UI — unprivileged nginx (#874) |
 | `trinity-mcp-server` | 8080:8080 | MCP Protocol Server |
 | `trinity-scheduler` | 8001:8001 | Scheduled tasks — runs as UID 1000 |
 | `trinity-redis` | 6379:6379 | Sessions, credentials, WS auth tickets — ACL-protected, two users (#589) |
 | `trinity-vector` | 8686:8686 | Log aggregation — runs as root but joins GID 1000 via `group_add` (#1799) so its file sink can write the UID-1000-owned `/data/logs`; `cap_drop: ALL` strips `CAP_DAC_OVERRIDE`, so without the group root's writes fail *silently* (healthcheck stays green) |
 | `trinity-logs-init` | — | One-shot `alpine` init (#1478): `chown 1000:1000 /data/logs` so UID-1000 Vector retention can write. Backend `depends_on` it (`service_completed_successfully`); exits immediately, `restart: no` |
+| `trinity-archives-init` | — | **Dev compose only** — the missed sibling of `logs-init` (#2205, v0.9.0): `chown 1000:1000 && chmod 775 /data/archives` on the named `trinity-archives` volume, which Docker creates root-owned, so the UID-1000 backend could never write it and log archival died silently on every run. Runs on every `up` (repairs existing installs, idempotent); backend `depends_on` it. **Prod needs none**: `/data/archives` lives inside the `${TRINITY_DATA_PATH}` bind mount that `start.sh` chowns recursively |
 | `trinity-postgres` | 5432:5432 | **Optional** PostgreSQL backend (#300) — dev-compose only, behind `--profile postgres`. Off by default (SQLite). See [Database Backend](#database-backend-sqlite-default--postgresql-300). |
 | `agent-{name}` | — | Per-agent isolated containers |
 
@@ -599,7 +659,7 @@ On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you 
 - **Platform services** — a shared `x-logging` anchor in both compose files, interpolated from `CONTAINER_LOG_MAX_SIZE` / `CONTAINER_LOG_MAX_FILE`. Adopted on the next `docker compose up`.
 - **Agent containers** — created through the Docker SDK, not compose, so compose's `logging:` can never reach them. Capped from `AGENT_LOG_MAX_SIZE` / `AGENT_LOG_MAX_FILE`, read by the **backend** at import time. Existing agents adopt a change when **recreated**, not merely restarted.
 
-Defaults are 10m × 3 = 30 MB per container (~4 days for a busy agent). An invalid or out-of-range value logs a warning and falls back to the default, so a typo can never leave a container uncapped. The raw Docker log is a secondary copy — Vector's aggregate at `/data/logs` is the primary, queryable one and has its own `LOG_RETENTION_DAYS`.
+Defaults are 10m × 3 = 30 MB per container (~4 days for a busy agent). An invalid or out-of-range value logs a warning and falls back to the default, so a typo can never leave a container uncapped. The raw Docker log is a secondary copy — Vector's aggregate at `/data/logs` is the primary, queryable one and has its own `LOG_RETENTION_DAYS`. Its archival into `/data/archives` (`LOG_ARCHIVE_ENABLED`) was **dead on every dev install before v0.9.0** (#2205, root-owned archives volume) — expect the first archival pass after upgrading to reclaim a backlog, and an unwritable archive dir now raises an operator-queue alarm under the `_log-archive` sentinel instead of failing into the very logs it cannot prune.
 
 **Network topology (#589):** Two bridges replace the old single network.
 - `trinity-platform-network` — Redis, scheduler, backend, mcp-server, vector, otel, **postgres**. Agents NEVER join (so agents can never reach the database).
@@ -631,7 +691,9 @@ Both the backend and the standalone scheduler read the same `DATABASE_URL`, so t
 - A brand-new Postgres DB (no `/migrate-to-postgres` run) is *fresh and empty* — enabling `DATABASE_URL` alone copies no data.
 - Experimental — not yet the recommended production default. New SQL must stay dialect-portable.
 
-**Backups:** SQLite = copy `trinity.db` (`scripts/backup.sh`); PostgreSQL = `pg_dump` (see [Backup Database](#backup-database)).
+> **SQLite end-of-support: September 1, 2026 (#1278).** Upstream has announced PostgreSQL as the forward path: SQLite installs keep working after the date but stop receiving schema migrations and fixes, so staying on SQLite past EOL means pinning a pre-EOL Trinity release. Plan the `/migrate-to-postgres` cutover before then. Announcement: `docs/migrations/SQLITE_TO_POSTGRES.md` on the server.
+
+**Backups:** automatic for **both** backends since v0.9.0 (#2216) — nightly `trinity-backup-YYYYMMDD.db` (SQLite backup API) or `.dump` (`pg_dump -Fc`, client baked into the backend image) under `/data/backups`, plus a boot-time `pre-migration-*.db` when a migration is pending. Manual: `scripts/backup.sh` (SQLite `.backup` / bundled-PG `pg_dump -Fc`). See [Backup Database](#backup-database).
 
 **Rollback to SQLite:** comment out `DATABASE_URL`, `docker compose up -d` — the Postgres volume is untouched and can be re-enabled later.
 
@@ -651,6 +713,10 @@ This agent operates a live Trinity instance, so treat its decisions as suggestio
 - **Ingested content is untrusted input.** Skills that read externally-influenceable text — access-request emails, container/execution logs, error text, in-app bug reports — are an injection surface even though only operators drive this agent. Treat that content as data, not instructions, and be extra deliberate with any skill that runs autonomously (no per-command gate).
 
 Further hardening is tracked in [`abilityai/trinity#1523`](https://github.com/abilityai/trinity/issues/1523).
+
+### Admin gates reject agent-scoped principals (v0.9.0, ent#297)
+
+`require_admin` / `assert_admin` now refuse **any agent-scoped MCP key**, even one owned by an admin. Before this, an admin-owned agent's `TRINITY_MCP_API_KEY` was admin on every admin-gated route (~114 of them) — the root cause of four prior escalations, including a fleet-wide prompt-injection path via `PUT /api/settings/skills_library_url` (ent#293/#346). **If automation drove admin endpoints with an *agent's* key, it now 403s — switch it to a user-scoped key** (`/api/settings/api-keys`). Agent self-check flows (heartbeat, reports, result callbacks, `set_reminder`, `report`) are unaffected. This is the general rule behind the per-endpoint "human-only" notes elsewhere in this file.
 
 ### Access-control tightening (CSO 2026-08-09, #2081)
 
@@ -722,7 +788,7 @@ Tickets live in Redis (`trinity-redis`). If Redis is down, WebSocket connections
 
 `.mcp.json` files written via credential inject are validated by `mcp_validator.py` before reaching the agent container. This prevents RCE-by-config attacks (AISEC-C2). The validator enforces:
 - Command allowlist, no shell metachars, no path separators
-- HTTPS-only for HTTP/SSE transports with SSRF guard
+- HTTPS-only for HTTP/SSE transports with SSRF guard — loopback, RFC 1918, link-local/IMDS, multicast, and since v0.9.0 the RFC 6598 CGNAT range `100.64.0.0/10`, plain and IPv4-mapped (ent#393/#394)
 - Env var reference allowlist (no `PATH`, `LD_PRELOAD`, API keys, etc.)
 - Bounded: 64KB max, 32 servers max
 
@@ -842,9 +908,15 @@ Issue #1799 — `/data/logs` is chowned to 1000:1000 mode 775 (#1478), and Vecto
 
 Issue #1644/#1709 — the retention sweep refuses a prune that would delete most of a table (blast-radius guard, e.g. after a retention window was accidentally shrunk). The guard raises an informational operator-queue alarm, but responding to that alarm authorizes nothing — the only gate is `POST /api/settings/retention/acknowledge` (see API Access), which is **human-only** (agent-scoped MCP keys are rejected even with admin role), single-use, and bound to the exact `window_days` in force. Check effective windows first with `GET /api/settings/retention`; widen the window if the shrink was accidental, or acknowledge to let the prune run once.
 
+Since v0.9.0 (#2146 / #1833 / #1834) the guard **refuses instead of raising** on a count it cannot interpret (`None`, a string, a negative error sentinel), and such a sweep appears under `blocked_sweeps` in `GET /api/settings/retention` — *blocked, not pending*: an acknowledgement cannot clear it (the count itself is broken, look at the backend logs for `REFUSED`), and before this fix the same input 500'd the whole retention panel while the sweep sat silently blocked in `cleanup_service`. A refusal alarm that fails to write is now **retried every cycle** rather than marked seen (#1834). Note that `blocked_sweeps` only covers the two ack-gated sweeps; a refusal on the other windows reaches you only through the operator-queue alarm.
+
 ### Long-running agent task killed at 60min
 
-Default execution timeout was bumped 15min → 60min (#665). The deadline is now the **per-agent** `execution_timeout_seconds` (clamped by the schedule cap, #929) — the scheduler honors it (#913 / #922). The old **per-task `timeout_seconds` override is deprecated** (#1068): still honored-but-clamped this release, removed in a follow-up. To extend the wall, raise the agent's `execution_timeout_seconds` (Agent Detail → Settings, or `PATCH /api/agents/{name}`) rather than passing a per-task override.
+Default execution timeout was bumped 15min → 60min (#665). The deadline is now the **per-agent** `execution_timeout_seconds` (clamped by the schedule cap, #929) — the scheduler honors it (#913 / #922). The old **per-task `timeout_seconds` override is deprecated** (#1068): still honored-but-clamped this release, removed in a follow-up. To extend the wall, raise the agent's `execution_timeout_seconds` (Agent Detail → Settings, or `PATCH /api/agents/{name}`) rather than passing a per-task override. **Workspace chat turns** honour the same per-agent timeout since v0.9.0 (#2214) — before that they were hard-capped at 300s regardless of the agent's setting.
+
+### Fan-out turn recorded SUCCESS but the subagents' work is missing
+
+Issue #2127 / #1870 (v0.9.0) — `claude --print` emits one `result` line per turn *segment* and deliberately stays alive between segments to await background subagents. The old early-completion treated the first `result` as the end of the turn and SIGTERMed the process group 2s later with exit 0 — so a fan-out was killed mid-wait, recorded **success**, billed, and stored "I'll wait for the notification" as the response (or surfaced as `error_during_execution` when the timing differed, #1870). Early-finalize now requires all three: a result seen **and** no waited background tasks in the ledger **and** stdout silent for `AGENT_IDLE_FINALIZE_S` (default 300s; ≤0 refused). Consequences: fan-outs now run to completion, so they spend more and can newly hit `--max-turns`; agents with an execution timeout under ~300s lose the early finalize (an honest 504 instead of a rescued success). **Requires a base-image rebuild plus a cold agent recreate** — a fleet on the old image still has the bug. Tune `AGENT_IDLE_FINALIZE_S` from the longest silence a healthy run produces (one long assistant message is a single stdout line, measured ~40s of dead air for ~10k chars); bias generous — too low silently truncates a finished deliverable and calls it success.
 
 ### PostgreSQL backend won't connect
 
@@ -867,7 +939,7 @@ Trinity validates `.mcp.json` content before writing it (AISEC-C2 hardening). A 
 
 - `command` not in allowlist (`npx`, `uvx`, `python`, `python3`, `node`, `bun`, `deno`, `docker`)
 - Shell metacharacters (`&`, `;`, `|`, `$()`, backticks) in `command` or `args`
-- HTTP/SSE server URL is not HTTPS or resolves to a private/loopback address (SSRF guard)
+- HTTP/SSE server URL is not HTTPS or resolves to a private/loopback/CGNAT (`100.64.0.0/10`, ent#394) address (SSRF guard)
 - Server named `trinity` (reserved — auto-injected by platform)
 - Env var references to reserved names (`PATH`, `LD_PRELOAD`, `ANTHROPIC_API_KEY`, etc.)
 - Content exceeds 64KB or more than 32 servers defined
@@ -893,7 +965,7 @@ Issue #1984/#1985 and #2015/#2026 — two defects that compounded.
 
 `POST /api/audit-log/verify` used to answer `valid: true, checked: 0` for a log where **no** entry carried a hash, which is the default on any install that never enabled hashing. `valid` is now tri-state — `true` verified, `false` tampered, **`null` unverifiable** — and `status` carries the precise verdict (`verified`, `verified_partial`, `tampered`, `unverifiable`, `empty_range`), with `skipped_unhashed` counting a late-enabled chain's permanent unhashed prefix.
 
-Separately, the hash-chain **toggle** wrote nothing and nothing restored it at boot, so every backend restart silently switched the integrity control back off; and the chain head lived in process memory, so multiple uvicorn workers each kept their own head and `verify_chain` could report an untampered log as **tampered**. Both are now DB-backed (`system_settings` + chain head read from the DB). If you enabled hashing before v0.9.0-dev, expect a `verified_partial` range spanning old restarts — that is history, not tampering.
+Separately, the hash-chain **toggle** wrote nothing and nothing restored it at boot, so every backend restart silently switched the integrity control back off; and the chain head lived in process memory, so multiple uvicorn workers each kept their own head and `verify_chain` could report an untampered log as **tampered**. Both are now DB-backed (`system_settings` + chain head read from the DB). If you enabled hashing before v0.9.0, expect a `verified_partial` range spanning old restarts — that is history, not tampering.
 
 ### Docker data root filling up / dockerd wedged
 
@@ -909,7 +981,7 @@ An empty `{}` means the container predates the cap. Platform services adopt it o
 
 ### Agent's MCP tools 401 / Trinity MCP key drifted
 
-Issue #1854 — an agent's own `scope='agent'` Trinity MCP key can drift from what the platform believes it holds (stale `.mcp.json` after a restore, a rotated key that never reached the container). Since v0.9.0-dev this **self-heals at start**: a start-time drift predicate detects the mismatch and re-delivers, unattended, on the agent's next start. `trinity-system` and ephemeral agents are exempt.
+Issue #1854 — an agent's own `scope='agent'` Trinity MCP key can drift from what the platform believes it holds (stale `.mcp.json` after a restore, a rotated key that never reached the container). Since v0.9.0 this **self-heals at start**: a start-time drift predicate detects the mismatch and re-delivers, unattended, on the agent's next start. `trinity-system` and ephemeral agents are exempt.
 
 ```bash
 # What does the platform think, and what does the container actually hold?
@@ -930,6 +1002,8 @@ Issue #2092 — `recreate_container_with_updated_config` always started the repl
 
 Current Trinity refuses with a `ValueError` unless you pass `require_running=False`, and `preserve_run_state=True` leaves the replacement stopped. This repo's `/rebuild-agent` skill passes both. If you drive a rebuild by hand, do the same — and always compare run state before and after.
 
+**Follow-on (#2186, fixed in v0.9.0):** the #2092 guard defaulted `require_running=True` and `start_agent_internal` — the one caller whose *job* is to start a stopped container — inherited it, so on dev builds between #2092 and #2186 `POST /api/agents/{name}/start` returned an opaque **500 for any stopped agent with config or image drift**, and cold-start base-image adoption (#1809, which fires *only* for stopped containers) was unreachable: every stopped agent failed to start after any `build-base-image.sh` run. On such a build, `/rebuild-agent` (which passes `require_running=False` itself) is the workaround; on v0.9.0 a start of a stopped agent recreates and reports `{recreated: true, recreate_reason: "config_drift" | "image_drift"}`.
+
 ### Update broke things — rollback
 
 ```bash
@@ -945,6 +1019,38 @@ TRINITY=${TRINITY_PATH:-~/trinity}
 ./scripts/run.sh "cd $TRINITY && sudo docker compose -f ${COMPOSE_FILE:-docker-compose.prod.yml} build --no-cache backend frontend mcp-server scheduler"
 ./scripts/run.sh "cd $TRINITY && sudo docker compose -f ${COMPOSE_FILE:-docker-compose.prod.yml} up -d"
 ```
+
+If the update ran a **schema migration** you also need the pre-update database: `/update` takes one (`~/backups/trinity-<ts>.db`), and since v0.9.0 the backend itself writes `/data/backups/pre-migration-<ts>.db` at boot whenever a migration is pending (#2216). Restore with backend **and scheduler** stopped and stale `-wal/-shm/-journal` sidecars removed first — see [Backup Database](#backup-database); `/rollback <commit> <backup>` does the whole sequence.
+
+### Nightly database backup failed / "backups are stale" alarm
+
+Issue #2216 (v0.9.0) — the daily 03:30 UTC job writes durable status to `system_settings` and raises an operator-queue item under the platform sentinel `_db-backup` on the ok→failed edge (`failed` | `skipped_no_space`), then re-alarms **weekly** while the newest success is older than 3 days. Free-space preflight *skips loudly* and never prunes-to-make-room, so `skipped_no_space` means the disk is genuinely tight (see [Disk space](#disk-space)).
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api/settings/retention | jq .backup
+./scripts/run.sh "sudo docker logs trinity-backend --tail 2000 2>&1 | grep '\[DBBackup\]' | tail -20"
+./scripts/run.sh "sudo docker exec trinity-backend ls -lh /data/backups/"
+```
+
+- `enabled: false` — `DB_BACKUP_ENABLED=false` in the server `.env` (or the var not forwarded — both compose files forward it since v0.9.0).
+- PostgreSQL `failed` with a `pg_dump` version error — the baked client is v17 and dumps servers ≤ 17; a newer managed server needs a newer image or your provider's tooling.
+- The job is day-keyed and idempotent (today's artifact exists → skip with INFO), and correctness never depends on the Redis `db_backup:running` lease — a Redis outage cannot corrupt an artifact.
+
+### Log archival dead — `/data/logs` growing, `/data/archives` empty
+
+Issue #2205 (v0.9.0) — on the **dev compose**, `trinity-archives` is a named volume Docker creates root-owned, and the UID-1000 backend could never write it: `archive_storage.__init__`'s `mkdir(exist_ok=True)` succeeded on someone else's directory, so only the first *write* failed, with `[Errno 13] Permission denied` written into the very log files archival exists to prune (measured on a real instance: 8.5 GB of logs, one 4.6 GB file, failing for months). Same silent class as #1478 and #1871.
+
+```bash
+./scripts/run.sh "sudo docker exec trinity-backend ls -ld /data /data/archives /data/logs"     # want 1000:1000 (trinity) on all three
+./scripts/run.sh "sudo docker exec trinity-backend sh -c 'touch /data/archives/.perm-probe && rm /data/archives/.perm-probe && echo writable'"
+./scripts/run.sh "sudo du -sh /var/lib/docker/volumes/trinity_trinity-logs/_data 2>/dev/null"
+```
+
+Fix: update to v0.9.0 — the new `trinity-archives-init` one-shot chowns the volume on **every** `up` (repairs existing installs), and an unwritable dir now raises an operator-queue alarm under `_log-archive`. On an older build: `sudo docker run --rm -v trinity_trinity-archives:/data/archives alpine sh -c 'chown 1000:1000 /data/archives && chmod 775 /data/archives'`. Prod is unaffected (the directory lives inside the `start.sh`-chowned bind mount). Expect the first archival pass afterwards to reclaim the backlog.
+
+### Operator-queue items from `_db-backup` / `_log-archive`
+
+Those are not agents. Platform maintenance jobs file their alarms directly (bypassing the #1632 agent-ingestion caps by construction) under uncreatable sentinel names — `_db-backup` (#2216), `_log-archive` (#2205), plus the reserved id prefixes `db-backup-`, `log-archive-`, `alert-budget-` — so an agent can neither pre-create nor silence them. Responding to one authorizes nothing; it is a pointer to the runbook entries above. Related: platform alert emitters that an *agent* can influence (e.g. the unknown-slash-command alert) are now depth-budgeted per (agent, type) by `OPERATOR_ALERT_MAX_PENDING_PER_TYPE` (#1677, default 5) — at the cap you get one cooldown-gated `alert-budget-<agent>-<type>` episode item instead of a flood.
 
 ---
 
@@ -999,6 +1105,7 @@ TRINITY=${TRINITY_PATH:-~/trinity}
 | `LOG_RETENTION_DAYS` | Optional | Days to keep Vector logs (default **5** since v0.8.5 — community retention floor #1065; was 90). The floor is applied by *seeding* fresh installs, not clamping (#1645) — existing configured values are preserved, and any admin may widen windows. Check effective windows: `GET /api/settings/retention` |
 | `LOG_ARCHIVE_ENABLED` | Optional | Compress to `/data/archives` instead of delete (default true) |
 | `LOG_CLEANUP_HOUR` | Optional | UTC hour for daily cleanup job (default 3) |
+| `DB_BACKUP_ENABLED` / `DB_BACKUP_HOUR` / `DB_BACKUP_MINUTE` / `DB_BACKUP_PG_DUMP_TIMEOUT_SECONDS` | Optional (#2216, defaults `true` / `3` / `30` / `1800`) | Automatic nightly database backup, **both backends**, default ON — artifacts under `/data/backups` (same-disk scope). `false` disables both the nightly job and the boot-time pre-migration copy. Time is UTC (03:30 sits before the 04:15/04:30 destructive maintenance jobs); malformed/out-of-range values fall back with a WARNING. Forwarded by both compose files (an unforwarded var is inert, #1486 class). Retention is deliberately NOT an env var — it is the ops setting `backup_retention_days` (default 14, min-keep 3), see [Backup Database](#backup-database) |
 | `CANARY_ENABLED` | Staging/dev | Run 5-min invariant watcher loop (default 0). **Now forwarded by `docker-compose.prod.yml` (#1876)** — before that the knob was inert in prod, so the watcher was un-enableable on the very instance it exists to watch. One cycle per fleet, not one per uvicorn worker (#1881) |
 | `CANARY_SLACK_WEBHOOK_URL` | Optional | Slack webhook for canary green→red transitions |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Optional | OpenTelemetry collector endpoint |
@@ -1030,11 +1137,13 @@ TRINITY=${TRINITY_PATH:-~/trinity}
 | `DISPATCH_BREAKER_ENABLED` | Optional (#526/#1487, default false) | GLOBAL gate for the per-agent dispatch circuit breaker that fast-fails NEW executions (503) when an agent is auth-dead instead of poisoning the backlog. Two-tier: this flag AND the per-agent toggle (`PUT /api/agents/{name}/circuit-breaker`) must BOTH be on — with this off, the per-agent toggle no-ops |
 | `REMINDER_MESSAGE_MAX_CHARS` / `REMINDER_MIN_DELAY_SECONDS` / `REMINDER_MAX_DELAY_SECONDS` / `MAX_PENDING_REMINDERS_PER_AGENT` / `MAX_REMINDERS_PER_AGENT_PER_DAY` / `REMINDER_RATE_LIMIT` | Optional (#1296) | Agent self-reminder caps: message 4000 chars, fire window 60s–30d, 25 pending + 100/day per agent, 30 `set_reminder` calls/agent/60s. All have working code defaults |
 | `OPERATOR_QUEUE_*` (14 caps: `_MAX_PENDING_PER_AGENT`, `_CREATE_RATE_LIMIT`/`_WINDOW`, `_FLEET_CREATE_RATE_LIMIT`, `_MAX_SCAN_PER_CYCLE`, `_MAX_FILE_BYTES`, `_TITLE_MAX`, `_QUESTION_MAX`, `_CONTEXT_MAX_BYTES`, `_OPTIONS_MAX_BYTES`, `_ID_MAX`, `_EXECUTION_ID_MAX`, `_FLOOD_ALERT_COOLDOWN_SECONDS`) | Optional (#1632) | Ingestion caps bounding a compromised/runaway agent flooding `~/.trinity/operator-queue.json` — depth (25 pending/agent), rate (60/agent + 300/fleet per 60s), file-size (2 MB skip), field-size truncation, one flood alert per agent per 5 min. Generous by design: cap abuse, not use |
+| `OPERATOR_ALERT_MAX_PENDING_PER_TYPE` | Optional (#1677, default 5) | Per-(agent, alert-type) pending-depth budget for **platform** operator-queue emitters an agent can influence (the #1632 caps only bound the agent-authored *file* seam; direct-DB platform creates were exempt — e.g. an unknown slash-command alert minted one `priority:high` row per distinct command at dispatch throughput). At the cap: one cooldown-gated `alert-budget-<agent>-<type>` episode item; every failure arm fail-closed (suppresses the alert only — the FAILED execution row remains the primary surface) |
 | `PULL_MODE_PILOT_AGENTS` / `MAX_REDELIVERY` | Optional (#1081, default empty / 3) | Pull/work-stealing pilot (dark by default): comma-separated agent names opted into the agent-side pull worker pool. Backend-only process-env — needs a backend restart AND the agent recreated to engage. `MAX_REDELIVERY` = re-deliveries of an expired pull lease before the row is poison-parked to the operator queue |
 | `TRINITY_DEFAULT_SYSTEM_MANIFEST` | Optional (#1764, default empty) | First-run starter-fleet seed: on a genuinely fresh install, Trinity auto-deploys the bundled `config/manifests/default-system.yaml` once after setup. Set to a path (bind-mounted into the backend) for a custom manifest, or `disabled` to skip seeding |
 | `TRINITY_MANIFESTS_DIR` | Optional (#1911, default empty) | Directory the bundled-manifest catalog reads (`GET /api/systems/manifests` — the cards on Library → Install a system). Empty = the image's own `config/manifests`. An unreadable path yields an **empty catalog, not an error**, so the directory must be bind-mounted as well — setting this alone silently lists nothing |
 | `CONTAINER_LOG_MAX_SIZE` / `CONTAINER_LOG_MAX_FILE` | Optional (#1871, default `10m` / `3`) | json-file log cap for the **platform services**, via the shared `x-logging` compose anchor. Adopted on the next `docker compose up`. Sizes accept `<int>k\|m\|g` (max 1g); counts 1–10. Invalid/out-of-range logs a warning and falls back — a typo can never leave a container uncapped |
 | `AGENT_LOG_MAX_SIZE` / `AGENT_LOG_MAX_FILE` | Optional (#1871, default `10m` / `3`) | Same cap for **agent** containers. Read by the backend at import time, because agents are SDK-created and compose's `logging:` can never reach them. Existing agents adopt a change on **recreate**, not restart |
+| `AGENT_IDLE_FINALIZE_S` | Optional (#2127, blank = agent-side default 300) | How long a headless turn's stdout must be **silent** before the executor may finalize early once a `result` line has been seen and no waited background subagents remain — the third leg of the fix for fan-out turns being killed mid-wait and recorded as success. Set from the longest silence a HEALTHY run produces (~40s measured for a ~10k-char reply, so 300 is ~7×); too LOW silently truncates a finished deliverable, too high only delays lingering-child recovery — bias generous. `<= 0` is refused → default. Baked at create/recreate: existing agents pick up a change on **recreate**, not restart. Only worth lowering for agents with an execution timeout under ~5 min |
 | `A2A_OUTBOUND_ENABLED` | Optional (#736, default false) | Lets an agent task an **external** A2A agent (Google ADK, LangChain, Bedrock, a remote Trinity) — the platform's first backend-executed, credentialed, agent-triggerable outbound fetcher. Also requires ≥1 endpoint registered via `PUT /api/settings/a2a-endpoints`; agents choose a target by **name** and can never supply a URL. A `system_settings` row wins over this var at runtime (no restart) |
 | `MCP_A2A_TIMEOUT_MS` | Optional (#736, default 40000) | mcp-server-only ceiling for outbound-A2A fetches. Must stay **below** the MCP client's 30–60s gateway abort: if the gateway gives up first, the agent sees `fetch failed` while the credentialed call completes anyway, with no `task_id` to poll |
 | `MCP_INLINE_AUTH_ENABLED` | Optional (#848, default false) | Keyless MCP sign-in: a request with **no** `Authorization` header opens an anonymous session that may `request_login` / `verify_login` with a 6-digit email code, then use connector playbooks of agents shared with that address. A posture change on a network-exposed port — see [MCP Inline Email Auth](#mcp-inline-email-auth-issue-848). Requires `INTERNAL_API_SECRET`. Read by BOTH mcp-server (session gate) and backend (404s `/api/internal/mcp-auth/*` when off) |
@@ -1056,7 +1165,7 @@ TRINITY=${TRINITY_PATH:-~/trinity}
 | `scripts/status.sh` | Quick health check |
 | `scripts/restart.sh` | Restart all Trinity services |
 | `scripts/update.sh` | Pull latest, rebuild, restart |
-| `scripts/backup.sh` | Backup SQLite database |
+| `scripts/backup.sh` | Manual on-demand DB backup to `~/backups/` on the host — SQLite via `sqlite3 .backup` (never a raw `cp`), bundled-PG via `pg_dump -Fc`. The platform also backs itself up nightly (#2216) |
 | `scripts/tunnel.sh` | SSH tunnels for local browser access |
 
 ---

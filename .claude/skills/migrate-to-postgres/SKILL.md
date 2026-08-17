@@ -241,8 +241,12 @@ COMPOSE=${COMPOSE_FILE:-docker-compose.prod.yml}
 source .env
 TRINITY=${TRINITY_PATH:-~/trinity}
 
-# 1. First PostgreSQL backup, immediately
-./scripts/run.sh "sudo docker exec trinity-postgres pg_dump -U trinity trinity | gzip > ~/backups/trinity-pg-$(date +%Y%m%d-%H%M%S).sql.gz && ls -lh ~/backups/ | tail -3"
+# 1. First PostgreSQL backup, immediately (custom format — restorable with pg_restore; the same
+#    shape the platform's own nightly job writes to /data/backups/trinity-backup-YYYYMMDD.dump
+#    since v0.9.0, #2216 — pg_dump 17 is baked into the backend image for that)
+./scripts/run.sh "sudo docker exec trinity-postgres pg_dump -U trinity -Fc trinity > ~/backups/trinity-pg-$(date +%Y%m%d-%H%M%S).dump && ls -lh ~/backups/ | tail -3"
+# Then confirm the automatic job sees the new backend (block appears after the next 03:30 UTC run):
+#   curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api/settings/retention | jq .backup
 
 # 2. Credentials home. Pull BOTH values (value only — NOT the whole KEY= line) so they can be
 #    recorded in your password manager and in this ops agent's .env (gitignored). Do not echo
@@ -258,7 +262,7 @@ Then, without printing the secrets:
    - Append a **"This instance runs PostgreSQL"** note to `./CLAUDE.md` (under the *Database Backend* section): psql access (`sudo docker exec trinity-postgres psql -U trinity -d trinity`), the `pg_dump` backup command, an explicit warning that the SQLite recipes in *Database Operations* and the `/backup` / `/rollback` skills' DB steps **do not apply** until adapted, that canary stays disabled, and the frozen SQLite file's location + cutover date.
    - Write the migration log to `deploys/<ts>-postgres-migration.md`: rowcount table, timings, snapshot filenames, gate decisions, validation evidence.
 5. **Do NOT delete** the SQLite database — it is the rollback artifact. It goes stale from cutover; label it in `./CLAUDE.md`. Revisit removal after ~30 days of stable PG operation.
-6. **Follow-ups:** `/backup`, `/update` (its pre-update backup step), and `/rollback` still assume SQLite — until they are adapted to PG, take `pg_dump` backups manually (step 1 above).
+6. **Follow-ups:** `scripts/backup.sh` (and therefore `/update`'s pre-update step) is PG-aware for the *bundled* `trinity-postgres` (`pg_dump -Fc`), and the platform's nightly job covers PG automatically (v0.9.0+). `/rollback`'s DB-restore step still assumes SQLite — for PG, `pg_restore` into an empty database with backend+scheduler stopped (CLAUDE.md → Backup Database).
 
 ---
 

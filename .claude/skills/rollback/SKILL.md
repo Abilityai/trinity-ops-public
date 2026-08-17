@@ -12,7 +12,7 @@ automation: gated
 ## Arguments
 
 - `$0` — Commit hash or `HEAD~N` (default: `HEAD~1`)
-- `$1` — Optional: backup file to restore from `~/backups/` (e.g. `trinity-20260101-120000.db`)
+- `$1` — Optional: backup file to restore — a manual copy in `~/backups/` (e.g. `trinity-20260101-120000.db`) **or** one of the platform's own artifacts inside the data volume (v0.9.0+, #2216): `/data/backups/trinity-backup-YYYYMMDD.db` (nightly) or `/data/backups/pre-migration-YYYYMMDD-HHMMSS.db` (taken at boot right before the migration you are rolling back from). Pass the `/data/backups/...` path verbatim to use one of those.
 
 ## Examples
 
@@ -74,11 +74,16 @@ Confirm? (say "yes" to proceed)
 
 ### 6. Pre-Rollback Backup
 
+Safe online copy (sqlite3 backup API, bind-mount/volume + SQLite/PG auto-detected) — never `cp` a live DB:
+
 ```bash
-source .env
-BACKUP="trinity-pre-rollback-$(date +%Y%m%d-%H%M%S).db"
-./scripts/run.sh "mkdir -p ~/backups && sudo docker run --rm -v trinity_trinity-data:/data -v ~/backups:/backup alpine cp /data/trinity.db /backup/$BACKUP"
-echo "Pre-rollback backup: ~/backups/$BACKUP"
+./scripts/backup.sh     # → ~/backups/trinity-<ts>.db (or trinity-pg-<ts>.dump)
+```
+
+Record the filename as the pre-rollback backup. List the platform's own artifacts too, so the user can pick one for step 8 if they did not name a file:
+
+```bash
+./scripts/run.sh "sudo docker exec trinity-backend ls -lh /data/backups/ 2>/dev/null || echo '(no /data/backups — pre-v0.9.0 build)'"
 ```
 
 ### 7. Git Reset
@@ -92,10 +97,27 @@ TRINITY=${TRINITY_PATH:-~/trinity}
 
 ### 8. Restore Database (if specified)
 
+Restore with **both DB writers stopped** — backend AND scheduler (stopping only the backend leaves a live writer holding the file) — and with stale `-wal`/`-shm`/`-journal` sidecars removed beside the target first (a leftover journal from the *old* database beside a restored `.db` is a corruption hazard; harmless if absent). This is the sequence upstream's own `restore-database.sh` follows since #2216.
+
 ```bash
 source .env
-./scripts/run.sh "sudo docker run --rm -v trinity_trinity-data:/data -v ~/backups:/backup alpine cp /backup/{backup_file} /data/trinity.db"
+TRINITY=${TRINITY_PATH:-~/trinity}
+COMPOSE=${COMPOSE_FILE:-docker-compose.prod.yml}
+
+# 8a. Stop the writers
+./scripts/run.sh "cd $TRINITY && sudo docker compose -f $COMPOSE stop backend scheduler"
+
+# 8b. Data mount: bind (prod) or named volume (dev)
+DATA_MOUNT=$(./scripts/run.sh "sudo docker inspect trinity-backend --format '{{range .Mounts}}{{if eq .Destination \"/data\"}}{{if eq .Type \"bind\"}}{{.Source}}{{else}}trinity_trinity-data{{end}}{{end}}{{end}}'" | tr -d '[:space:]')
+DATA_MOUNT=${DATA_MOUNT:-trinity_trinity-data}
+
+# 8c. Source: a manual copy in ~/backups (mounted at /backup) or a platform artifact already inside /data/backups
+#     {backup_file} = trinity-20260101-120000.db          → SRC=/backup/{backup_file}
+#     {backup_file} = /data/backups/trinity-backup-*.db   → SRC={backup_file}
+./scripts/run.sh "sudo docker run --rm -v $DATA_MOUNT:/data -v ~/backups:/backup:ro alpine sh -c 'apk add --quiet sqlite && sqlite3 {SRC} "PRAGMA quick_check;" && rm -f /data/trinity.db-wal /data/trinity.db-shm /data/trinity.db-journal && cp {SRC} /data/trinity.db && chown 1000:1000 /data/trinity.db'"
 ```
+
+Abort (and restart the services with step 9's `up -d`) if `quick_check` prints anything but `ok`. **PostgreSQL** instances: `pg_restore` the `.dump` into an empty database while backend+scheduler are stopped, then point `DATABASE_URL` at it — see CLAUDE.md → Backup Database.
 
 ### 9. Rebuild and Restart
 
@@ -107,6 +129,8 @@ COMPOSE=${COMPOSE_FILE:-docker-compose.prod.yml}
 ./scripts/run.sh "cd $TRINITY && sudo docker compose -f $COMPOSE up -d backend frontend mcp-server scheduler"
 sleep 10
 ```
+
+Rolling back across a version that changed `docker/base-image/` leaves agents on the *newer* base image; that is safe (agents degrade forward-compatibly) but if you need the older runtime, rebuild the base image at the target commit and let agents adopt on a cold stop/start (see `/update` step 8b).
 
 ### 10. Verify Health
 

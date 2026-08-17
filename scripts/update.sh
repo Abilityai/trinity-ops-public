@@ -19,11 +19,16 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${BLUE}   Trinity Update - ${HOST}${NC}"
 echo -e "${BLUE}══════════════════════════════════════${NC}"
 
-# 1. Backup
+# 1. Backup (sqlite3 online-backup API — never a raw cp of a live DB; PG-aware)
+#    Trinity v0.9.0+ also writes /data/backups/pre-migration-*.db itself at boot
+#    when a migration is pending (#2216); this is the belt to that suspenders.
 echo -e "\n${YELLOW}[1/4] Backing up database...${NC}"
-BACKUP="trinity-$(date +%Y%m%d-%H%M%S).db"
-run "sudo docker run --rm -v trinity_trinity-data:/data -v /tmp:/backup alpine cp /data/trinity.db /backup/$BACKUP"
-echo -e "  ${GREEN}✓${NC} /tmp/$BACKUP"
+if "$SCRIPT_DIR/backup.sh"; then
+    echo -e "  ${GREEN}✓${NC} backup done"
+else
+    echo -e "  ${RED}✗${NC} backup failed — aborting update"
+    exit 1
+fi
 
 # 2. Pull
 echo -e "\n${YELLOW}[2/4] Pulling $BRANCH...${NC}"
@@ -35,6 +40,11 @@ if [ "$BEFORE" = "$AFTER" ]; then
 else
     echo -e "  ${GREEN}✓${NC} $AFTER"
 fi
+# Did the pulled range touch the agent base image? (#1809/#1860/#1816 — a
+# rebuilt base image is adopted on each agent's next cold stop/start, never
+# by a running agent; platform images are rebuilt below.)
+BEFORE_SHA=${BEFORE%% *}; AFTER_SHA=${AFTER%% *}
+BASE_CHANGED=$(run "cd $TRINITY && git diff --name-only $BEFORE_SHA $AFTER_SHA -- docker/base-image/ 2>/dev/null | wc -l" 2>/dev/null | tr -d '[:space:]' || echo 0)
 
 # 3. Rebuild
 echo -e "\n${YELLOW}[3/4] Rebuilding containers...${NC}"
@@ -50,6 +60,10 @@ sleep 10
 # Verify
 BACKEND=$(run "curl -s -o /dev/null -w '%{http_code}' http://localhost:${BACKEND_PORT:-8000}/health" 2>/dev/null)
 SCHED=$(run "sudo docker inspect trinity-scheduler --format='{{.State.Health.Status}}'" 2>/dev/null | tr -d '\r')
+# #1814: `version` = code in service, `image_version` = build it runs inside. Different = stale image.
+VER_JSON=$(run "curl -s http://localhost:${BACKEND_PORT:-8000}/api/version" 2>/dev/null || true)
+VER=$(echo "$VER_JSON" | jq -r '.version // "?"' 2>/dev/null || echo "?")
+IMG_VER=$(echo "$VER_JSON" | jq -r '.image_version // "?"' 2>/dev/null || echo "?")
 
 echo ""
 echo -e "${BLUE}══════════════════════════════════════${NC}"
@@ -59,6 +73,16 @@ else
     echo -e "  ${RED}✗${NC} Backend:   HTTP $BACKEND"
 fi
 echo -e "  Scheduler: $SCHED"
+echo -e "  Version:   $VER (image: $IMG_VER)"
+if [ -n "$IMG_VER" ] && [ "$IMG_VER" != "?" ] && [ "$IMG_VER" != "null" ] && [ "${IMG_VER%%+*}" != "$VER" ]; then
+    echo -e "  ${YELLOW}⚠${NC} image_version differs from version — platform image is stale; re-run the build step"
+fi
+if [ "${BASE_CHANGED:-0}" != "0" ]; then
+    echo -e "\n  ${YELLOW}⚠${NC} docker/base-image/ changed in this update ($BASE_CHANGED files)."
+    echo -e "    Rebuild it and let agents adopt it on a cold stop/start:"
+    echo -e "      ./scripts/run.sh \"cd $TRINITY && ./scripts/deploy/build-base-image.sh\""
+    echo -e "      then stop+start each agent (Operating Room -> Restart All, or /rebuild-agent)"
+fi
 
 if [ "$BACKEND" = "200" ]; then
     echo -e "\n${GREEN}Update complete!${NC}"

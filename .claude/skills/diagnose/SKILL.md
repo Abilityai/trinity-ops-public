@@ -74,6 +74,26 @@ source .env
 ./scripts/run.sh "sudo docker run --rm -v trinity_trinity-data:/data alpine sh -c 'apk add --quiet sqlite && sqlite3 /data/trinity.db \"PRAGMA integrity_check\"'"
 ```
 
+### 9b. Silent Maintenance-Job Failures (v0.9.0+)
+
+Two jobs whose failure mode is "healthy container, nothing happening" — the class behind #1478/#1871/#2205/#2216. Both need an admin token (see CLAUDE.md → API Access).
+
+```bash
+source .env
+# Admin token minted ON the host (ADMIN_PASSWORD from this agent's .env) so the query needs no tunnel
+./scripts/run.sh "TOKEN=\$(curl -s -X POST http://localhost:${BACKEND_PORT:-8000}/token -H 'Content-Type: application/x-www-form-urlencoded' -d 'username=admin&password=$ADMIN_PASSWORD' | jq -r .access_token); \
+  curl -s -H \"Authorization: Bearer \$TOKEN\" http://localhost:${BACKEND_PORT:-8000}/api/settings/retention | jq -c '.backup, {blocked_sweeps, pending_acknowledgements}'"
+# Nightly DB backup (#2216): status/last success/age/artifact count. enabled:false ⇒ DB_BACKUP_ENABLED=false.
+./scripts/run.sh "sudo docker exec trinity-backend ls -lh /data/backups/ 2>/dev/null | tail -5"
+# Log archival (#2205): the archives dir must be 1000:1000 and writable, else /data/logs grows unbounded
+./scripts/run.sh "sudo docker exec trinity-backend sh -c 'ls -ld /data /data/logs /data/archives; touch /data/archives/.perm-probe && rm /data/archives/.perm-probe && echo archives-writable'"
+./scripts/run.sh "sudo docker exec trinity-backend du -sh /data/logs /data/archives /data/backups 2>/dev/null"
+# Platform alarms filed under sentinel names (_db-backup, _log-archive) — pending items are actionable
+./scripts/run.sh "sudo docker logs trinity-backend --tail 2000 2>&1 | grep -E '\[DBBackup\]|\[ArchiveStorage\]|REFUSED' | tail -10"
+```
+
+Flag: `.backup.last_status` ≠ `ok`, newest success > 3 days old, `blocked_sweeps` non-empty, `/data/archives` not writable, or `/data/logs` far larger than `LOG_RETENTION_DAYS` should allow.
+
 ### 10. Network Check
 
 ```bash
@@ -101,6 +121,8 @@ source .env
 **Resource Warnings**: {disk/memory}
 
 **Database**: {integrity result}
+
+**Maintenance jobs**: backups {ok/failed/stale/disabled, last success}, archives {writable/NOT}, retention {blocked sweeps}
 
 ### Recommendations
 {Specific next steps based on findings}

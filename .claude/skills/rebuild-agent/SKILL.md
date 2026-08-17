@@ -12,6 +12,10 @@ Rebuilds agent containers using Trinity's internal `recreate_container_with_upda
 
 **Do NOT** hand-roll `docker create` commands for agent rebuilds — that silently drops fields.
 
+**When you need this skill vs. a plain stop/start (v0.9.0):** since #1809/#1860/#1816 a **cold stop → start** of an agent detects a rebuilt base image (or config drift) and recreates the container itself — `POST /api/agents/{name}/start` returns `{recreated: true, recreate_reason: "image_drift" | "config_drift"}` — and Operating Room → Restart All routes through the same lifecycle. A start of an already-*running* agent never image-recreates it, and `docker restart agent-*` adopts nothing. Reach for `/rebuild-agent` when you want a controlled wave that **preserves run state** (stopped agents stay stopped, #2092), or on a dev build between #2092 and #2186 where starting a stopped agent with drift 500s (this skill passes `require_running=False` itself, so it is the workaround there).
+
+**What survives a recreate:** the workspace volume, env, mounts, labels, limits — and since #1704 the agent's Claude Code **plugin selection**, which is persisted as a committed, secret-free `~/.trinity/plugins.yaml` manifest and re-installed by `startup.sh` if the plugin cache is missing (a git-based reconstitution onto a fresh volume drops the gitignored `~/.claude/plugins/`). A recreate onto the same volume runs zero installs. Also picked up on recreate, not restart: `AGENT_LOG_MAX_*`, `AGENT_TMP_SIZE`, `AGENT_IDLE_FINALIZE_S`, `AGENT_TOOL_STALL_LIMIT_S`.
+
 ## Arguments
 
 - `<name>` — rebuild one agent (omit the `agent-` prefix)

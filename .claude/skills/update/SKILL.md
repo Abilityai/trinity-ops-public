@@ -55,21 +55,16 @@ Start log with header: date, host, branch, operator (Claude Code).
 
 ### 5. Backup Database
 
+Use the safe online-backup primitive — **never `cp` a live `trinity.db`** (a raw copy mid-write, ignoring its journal, can be torn or stale; upstream retired its own `cp`-based script for this reason, #2216). `scripts/backup.sh` auto-detects bind mount vs named volume and SQLite vs bundled PostgreSQL:
+
 ```bash
-source .env
-TRINITY=${TRINITY_PATH:-~/trinity}
-COMPOSE=${COMPOSE_FILE:-docker-compose.prod.yml}
-BACKUP="trinity-$(date +%Y%m%d-%H%M%S).db"
-
-# Auto-detect: bind mount or Docker volume
-MOUNT_TYPE=$(./scripts/run.sh "sudo docker inspect trinity-backend --format '{{json .Mounts}}' 2>/dev/null | jq -r '.[] | select(.Destination == \"/data\") | .Type'" 2>/dev/null | tr -d '[:space:]')
-
-if [ "$MOUNT_TYPE" = "bind" ]; then
-  ./scripts/run.sh "mkdir -p ~/backups && sudo cp $TRINITY/trinity-data/trinity.db ~/backups/$BACKUP"
-else
-  ./scripts/run.sh "mkdir -p ~/backups && sudo docker run --rm -v trinity_trinity-data:/data -v ~/backups:/backup alpine cp /data/trinity.db /backup/$BACKUP"
-fi
+./scripts/backup.sh          # → ~/backups/trinity-<ts>.db (SQLite, sqlite3 .backup + quick_check)
+                             #   or ~/backups/trinity-pg-<ts>.dump (bundled PG, pg_dump -Fc)
 ```
+
+Exit code 2 = the instance runs a **managed/external PostgreSQL** — take the backup with `pg_dump -Fc` against the host (or the provider's snapshot) before continuing; do not skip.
+
+Since v0.9.0 the backend also writes `/data/backups/pre-migration-<ts>.db` at boot whenever a schema migration is pending, and the nightly job keeps `trinity-backup-YYYYMMDD.*` there — list them with `./scripts/run.sh "sudo docker exec trinity-backend ls -lh /data/backups/"` if you ever need a second recovery point.
 
 Log backup filename. Abort on failure.
 
@@ -108,6 +103,25 @@ COMPOSE=${COMPOSE_FILE:-docker-compose.prod.yml}
 ./scripts/run.sh "cd $TRINITY && sudo docker compose -f $COMPOSE build --no-cache backend frontend mcp-server scheduler"
 ```
 
+This step is load-bearing (#1814): `start.sh` never rebuilds platform images, so a bare `git pull` leaves the previous build running the new code. Step 11 verifies it took (`version` == `image_version`).
+
+### 8b. Agent Base Image — did the pulled range touch it?
+
+```bash
+source .env
+TRINITY=${TRINITY_PATH:-~/trinity}
+BEFORE_SHA=${BEFORE%% *}; AFTER_SHA=${AFTER%% *}
+./scripts/run.sh "cd $TRINITY && git diff --name-only $BEFORE_SHA $AFTER_SHA -- docker/base-image/ | head -30"
+```
+
+If anything is listed, the fleet is on a stale agent runtime until the base image is rebuilt **and each agent is recreated**:
+
+```bash
+./scripts/run.sh "cd $TRINITY && ./scripts/deploy/build-base-image.sh"
+```
+
+Adoption rules (v0.9.0, #1809 / #1860 / #1816): a **cold stop → start** of an agent detects the rebuilt image and recreates the container (`recreate_reason: "image_drift"`); Operating Room → **Restart All** routes through the same lifecycle; `trinity-system` adopts on its next stop/start. A start of an already-*running* agent never image-recreates it. For a controlled wave that preserves run state (stopped agents stay stopped), use `/rebuild-agent` — do **not** run `docker restart agent-*` (a plain restart adopts nothing). Report which path you took and whether the user wants the wave now; the base-image rebuild itself is safe to run immediately.
+
 ### 9. Restart Services
 
 ```bash
@@ -139,6 +153,10 @@ source .env
 BACKEND=$(./scripts/run.sh "curl -s -o /dev/null -w '%{http_code}' http://localhost:${BACKEND_PORT:-8000}/health" 2>/dev/null)
 SCHED=$(./scripts/run.sh "sudo docker inspect trinity-scheduler --format='{{.State.Health.Status}}'" 2>/dev/null | tr -d '[:space:]')
 ./scripts/run.sh "sudo docker ps --format 'table {{.Names}}\t{{.Status}}' | grep -E 'trinity|agent'"
+# #1814: version = code in service, image_version = build it runs inside. Different ⇒ step 8 did not take.
+./scripts/run.sh "curl -s http://localhost:${BACKEND_PORT:-8000}/api/version | jq '{version, image_version, git_commit_short}'"
+# #2216: the backend takes a pre-migration copy at boot when a migration was pending — confirm it landed
+./scripts/run.sh "sudo docker logs trinity-backend --tail 500 2>&1 | grep '\[DBBackup\]' | tail -5"
 ```
 
 ### 12. Check INTERNAL_API_SECRET
@@ -171,6 +189,8 @@ Write to `$DEPLOY_FILE`:
 | Backup | {filename} |
 | Backend | {HTTP 200 / failed} |
 | Scheduler | {healthy / unhealthy} |
+| Version / image | {version} / {image_version} — {match / STALE IMAGE} |
+| Base image changed | {no / yes — rebuilt + adoption path, or PENDING} |
 | INTERNAL_API_SECRET | {OK / CRITICAL} |
 | Tunnel | {restarted / not present} |
 

@@ -53,6 +53,8 @@ cat .claude/skills/sync-ops-knowledge/last-sync.json 2>/dev/null || echo '{"last
 
 Verify the recorded `last_commit` is still an ancestor of HEAD before diffing (`git merge-base --is-ancestor <last_commit> HEAD`) — a force-push or branch switch invalidates the range and the review must fall back to `--since N days`.
 
+**`from main` when the last sync was on `dev`:** upstream releases land on `main` as one squash commit (`Release: vX.Y.Z (#NNNN)`) and `dev` is then re-synced, so a dev-side `last_commit` is *not* an ancestor of `main` even though nothing was lost. Do not fall back to `--since`. Instead: (1) confirm the trees match — `git diff --stat origin/main origin/dev` empty — then (2) take the **content** delta as `git diff <last_commit> origin/main` and the **commit messages** from dev's granular history `git log --no-merges <last_commit>..origin/dev` (the squash commit on main has no per-change bodies). Read `docs/releases/<version>.md` from the release commit first — its "Behavior changes / upgrade notes" section is the operator-facing summary and lists every new env var. Record the main SHA as `last_commit` (it is an ancestor of dev too, so the next `from dev` sync ranges cleanly).
+
 SSH into the instance and collect git history:
 
 ```bash

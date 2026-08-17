@@ -37,11 +37,13 @@ source .env
 ./scripts/run.sh "sudo docker images -f 'dangling=true' --format '{{.Repository}}:{{.Tag}} {{.Size}}' | head -10"
 ```
 
-**Old backups** (files beyond 10 most recent):
+**Old backups** (manual copies in `~/backups/` beyond the 10 most recent — `.db` and `.dump`):
 ```bash
 source .env
-./scripts/run.sh "ls -t ~/backups/*.db 2>/dev/null | tail -n +11 | wc -l"
+./scripts/run.sh "ls -t ~/backups/*.db ~/backups/*.dump 2>/dev/null | tail -n +11 | wc -l"
 ```
+
+Do **not** touch the platform's own artifacts under `/data/backups/` (v0.9.0+, #2216) — the backend prunes those itself by `backup_retention_days` (default 14, newest 3 always kept). If they are eating the disk, widen/narrow that setting via `PUT /api/settings/ops/config`, never `rm`. Likewise `/data/archives` (log archives) is governed by `LOG_RETENTION_DAYS`.
 
 ### 3. Dry Run Output
 
@@ -73,7 +75,7 @@ source .env
 ./scripts/run.sh "sudo docker builder prune -f"
 
 # Remove old backups (keep latest 10)
-./scripts/run.sh "cd ~/backups && ls -t *.db 2>/dev/null | tail -n +11 | xargs -r rm -v"
+./scripts/run.sh "cd ~/backups && ls -t *.db *.dump 2>/dev/null | tail -n +11 | xargs -r rm -v"
 ```
 
 ### 5. Post-Cleanup Status
