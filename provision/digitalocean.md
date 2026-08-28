@@ -15,12 +15,14 @@ doctl account get               # Verify auth
 
 | Resource | Value | Cost |
 |----------|-------|------|
-| Size | `s-2vcpu-4gb` (2 vCPU, 4 GB) | $24/month |
+| Size | `s-2vcpu-8gb` (2 vCPU, 8 GB) | $48/month |
 | Region | `nyc3` or `fra1` | included |
 | OS | Ubuntu 24.04 LTS | free |
 | Backups | weekly automated | +$4.80/month |
 
-Need more headroom? Use `s-2vcpu-8gb` ($48/month).
+**Minimum: 8 GB RAM.** Below that the agent containers and the platform services contend and turns start failing under load.
+
+Need more headroom for a larger fleet? Step up to `s-4vcpu-16gb`.
 
 ## Upload Your SSH Key
 
@@ -54,7 +56,7 @@ EOF
 doctl compute droplet create trinity-server \
   --region nyc3 \
   --image ubuntu-24-04-x64 \
-  --size s-2vcpu-4gb \
+  --size s-2vcpu-8gb \
   --ssh-keys $KEY_ID \
   --user-data-file /tmp/trinity-init.sh \
   --enable-monitoring \

@@ -22,10 +22,12 @@ hcloud server-type list               # verify auth works
 
 | Type | vCPU | RAM | Disk | Cost | Use case |
 |------|------|-----|------|------|----------|
-| `cx23` | 2 | 4 GB | 40 GB SSD | **€3.49/mo** | dev, small production |
-| `cx33` | 4 | 8 GB | 80 GB SSD | ~€6-7/mo | production |
-| `cpx21` | 2 AMD | 4 GB | 40 GB SSD | ~€4.50/mo | better performance |
+| `cx33` | 4 | 8 GB | 80 GB SSD | **~€6-7/mo** | production — cheapest supported |
 | `cpx31` | 4 AMD | 8 GB | 80 GB SSD | ~€8.50/mo | best perf/price |
+| `cx23` | 2 | 4 GB | 40 GB SSD | €3.49/mo | ⚠️ below the 8 GB floor — not supported |
+| `cpx21` | 2 AMD | 4 GB | 40 GB SSD | ~€4.50/mo | ⚠️ below the 8 GB floor — not supported |
+
+**Minimum: 8 GB RAM.** Below that the agent containers and the platform services contend and turns start failing under load.
 
 **Locations:** `nbg1` (Nuremberg), `fsn1` (Falkenstein), `hel1` (Helsinki), `ash` (Ashburn, US)
 
@@ -79,7 +81,7 @@ EOF
 # 4. Create the server
 hcloud server create \
   --name trinity-server \
-  --type cx23 \
+  --type cx33 \
   --location nbg1 \
   --image ubuntu-24.04 \
   --ssh-key trinity-key \

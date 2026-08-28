@@ -568,12 +568,12 @@ Key tables:
 
 Trinity runs on any Linux VM with Docker. Choose your provider:
 
-| Provider | Guide | Cheapest option |
+| Provider | Guide | Cheapest supported option |
 |----------|-------|-----------------|
-| **Hetzner** | `provision/hetzner.md` | CX23 at €3.49/month |
-| **Google Cloud** | `provision/gcp.md` | e2-medium ~$40/month |
-| **AWS** | `provision/aws.md` | t3.medium ~$30/month |
-| **DigitalOcean** | `provision/digitalocean.md` | s-2vcpu-4gb $24/month |
+| **Hetzner** | `provision/hetzner.md` | CX33 at ~€6-7/month |
+| **Google Cloud** | `provision/gcp.md` | e2-standard-2 ~$65/month |
+| **AWS** | `provision/aws.md` | t3.large ~$60/month |
+| **DigitalOcean** | `provision/digitalocean.md` | s-2vcpu-8gb $48/month |
 | **Localhost** | `provision/localhost.md` | Free |
 
 All guides provision Ubuntu 24.04 with Docker via cloud-init, then walk you through installing Trinity and pointing this ops agent at the instance.
@@ -582,8 +582,8 @@ All guides provision Ubuntu 24.04 with Docker via cloud-init, then walk you thro
 
 | Resource | Minimum | Recommended |
 |----------|---------|-------------|
-| CPU | 1 vCPU | 2 vCPU |
-| RAM | 2 GB | 4 GB |
+| CPU | 2 vCPU | 4 vCPU |
+| RAM | 8 GB | 16 GB |
 | Disk | 20 GB | 50 GB |
 | OS | Ubuntu 22.04+ | Ubuntu 24.04 |
 

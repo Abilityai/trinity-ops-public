@@ -15,12 +15,14 @@ aws sts get-caller-identity          # Verify auth
 
 | Resource | Value | Est. cost |
 |----------|-------|-----------|
-| Instance | `t3.medium` (2 vCPU, 4 GB) | ~$30/month |
+| Instance | `t3.large` (2 vCPU, 8 GB) | ~$60/month |
 | Storage | 50 GB gp3 EBS | ~$4/month |
 | Region | `us-east-1` | (lowest pricing) |
 | OS | Ubuntu 24.04 LTS | free |
 
-Need more? Use `t3.large` (2 vCPU, 8 GB, ~$60/month).
+**Minimum: 8 GB RAM.** Below that the agent containers and the platform services contend and turns start failing under load.
+
+Need more headroom for a larger fleet? Step up to `t3.xlarge` (4 vCPU, 16 GB).
 
 ## Create the Instance
 
@@ -69,7 +71,7 @@ chmod 600 ~/.ssh/trinity-aws.pem
 INSTANCE_ID=$(aws ec2 run-instances \
   --region us-east-1 \
   --image-id $AMI \
-  --instance-type t3.medium \
+  --instance-type t3.large \
   --key-name trinity-key \
   --security-group-ids $SG_ID \
   --user-data file:///tmp/trinity-init.sh \

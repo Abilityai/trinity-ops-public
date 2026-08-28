@@ -15,12 +15,14 @@ gcloud config set project YOUR_PROJECT_ID
 
 | Resource | Value | Est. cost |
 |----------|-------|-----------|
-| Machine type | `e2-medium` (2 vCPU, 4 GB) | ~$40/month |
+| Machine type | `e2-standard-2` (2 vCPU, 8 GB) | ~$65/month |
 | Boot disk | 50 GB SSD (`pd-ssd`) | ~$8/month |
 | Region/Zone | `us-central1-c` | (lowest tier) |
 | OS | Ubuntu 24.04 LTS | free |
 
-Need more headroom? Use `e2-standard-2` (2 vCPU, 8 GB, ~$65/month).
+**Minimum: 8 GB RAM.** Below that the agent containers and the platform services contend and turns start failing under load.
+
+Need more headroom for a larger fleet? Step up to `e2-standard-4` (4 vCPU, 16 GB).
 
 ## Create the VM
 
@@ -44,7 +46,7 @@ gcloud compute firewall-rules create trinity-web \
 # Create the VM
 gcloud compute instances create trinity-server \
   --zone=us-central1-c \
-  --machine-type=e2-medium \
+  --machine-type=e2-standard-2 \
   --image-family=ubuntu-2404-lts \
   --image-project=ubuntu-os-cloud \
   --boot-disk-size=50GB \
