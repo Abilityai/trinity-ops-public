@@ -88,8 +88,8 @@ The agent reads `CLAUDE.md` as its system prompt — it knows how to operate Tri
 
 | Resource | Minimum | Recommended |
 |----------|---------|-------------|
-| CPU | 1 vCPU | 2 vCPU |
-| RAM | 2 GB | 4 GB |
+| CPU | 2 vCPU | 4 vCPU |
+| RAM | 8 GB | 16 GB |
 | Disk | 20 GB | 50 GB |
 | OS | Ubuntu 22.04+ | Ubuntu 24.04 |
 
