@@ -15,6 +15,10 @@ argument-hint: [list|start|stop|logs|exec] [agent-name] [command]
 - `stop <name>` — stop agent-{name}
 - `logs <name> [lines]` — view agent logs (default 50 lines)
 - `exec <name> <command>` — run command inside agent container
+- `policy` — restart-policy census (v0.9.5, #2541)
+- `dump <name>` — thread dump of a wedged agent server (v0.9.5, #2503)
+
+**Restart semantics (v0.9.5, #2541):** agent containers are `restart: unless-stopped`. `docker stop` sets Docker's manual-stop flag, so a stopped agent **stays stopped** across host reboots — but only if the stop succeeded. `docker start` of a stopped agent bypasses Trinity's start ladder (drift/image adoption, MCP-key self-heal); prefer `POST /api/agents/{name}/start` when the base image or config may have changed. Containers created before 0.9.5 keep `RestartPolicy=no` until recreated or swept (`/update` step 8c).
 
 ## Instructions
 
@@ -65,6 +69,18 @@ source .env
 ```bash
 source .env
 ./scripts/run.sh "sudo docker exec agent-{name} {command}"
+```
+
+**Policy** (name · restart policy · restart count — `no` = pre-0.9.5 container, dies on reboot; a climbing count is a crash loop re-running `startup.sh` each retry):
+```bash
+source .env
+./scripts/run.sh "for c in \$(sudo docker ps -a --format '{{.Names}}' | grep '^agent-'); do echo \"\$c \$(sudo docker inspect -f '{{.HostConfig.RestartPolicy.Name}} restarts={{.RestartCount}} state={{.State.Status}}' \$c)\"; done"
+```
+
+**Dump** (SIGUSR1 → every thread's stack to the container log, frames only, no restart; `[Diagnostics] EVENT LOOP STALLED` lines mean the agent server's loop is wedged):
+```bash
+source .env
+./scripts/run.sh "sudo docker exec agent-{name} kill -USR1 1; sleep 1; sudo docker logs agent-{name} --tail 300 2>&1 | grep -A60 'THREAD DUMP' | tail -80"
 ```
 
 ### 4. Handle Errors

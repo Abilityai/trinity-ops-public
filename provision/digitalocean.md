@@ -11,6 +11,37 @@ doctl auth init                 # Paste API token from cloud.digitalocean.com/ap
 doctl account get               # Verify auth
 ```
 
+## One-command install (Trinity ≥ 0.9.5, recommended)
+
+Upstream ships `scripts/deploy/trinity-do-create.sh` (#2380 / #2707). Run it on **your** machine:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/abilityai/trinity/<tag>/scripts/deploy/trinity-do-create.sh)
+```
+
+It prompts for the admin password (×2), a Claude token, region and droplet name, then:
+
+- creates an `s-4vcpu-8gb` Ubuntu 24.04 droplet ($48/mo; hosted mode needs 8 GB) with your account's SSH keys attached;
+- injects user-data that clones Trinity at `<tag>` into `/opt/trinity` and runs `start.sh --provision --cloud digitalocean --hosted --unattended` — Docker CE, Caddy (pinned 2.11.4) serving **HTTPS on the bare IP** with a Let's Encrypt IP certificate, ufw (22/80/443), a `TRINITY-FW` Docker firewall (no published port reachable off-box; containers cannot reach the metadata service), then prebuilt GHCR images (`TRINITY_IMAGE_TAG=<tag>`, pinned in `.env`);
+- waits for HTTPS. The admin is pre-provisioned from your prompt, so there is **no browser-claim window** (unlike the Marketplace 1-Click image).
+
+Afterwards: `FRONTEND_PORT=8081` on the box (Caddy owns 80/443), `TRINITY_INSTALL_SOURCE=do-script` was recorded, and the first-run UI offers a "Secure this instance" step. A custom domain = save the Public URL in Settings → General and point an A record at the droplet; Caddy issues the certificate on first visit (`GET /api/public/tls-allowed?domain=` gates it to that exact host). Upgrades are `cd /opt/trinity && sudo ./scripts/deploy/start.sh --hosted` after bumping `TRINITY_IMAGE_TAG`.
+
+Ops-agent `.env` for such a droplet:
+
+```bash
+SSH_HOST=<PUBLIC_IP>
+SSH_USER=root
+TRINITY_PATH=/opt/trinity
+COMPOSE_FILE=docker-compose.hosted.yml
+FRONTEND_PORT=8081
+BACKEND_PORT=8000
+```
+
+Note: the backend port is not reachable from outside the box (the firewall drops it) — API calls from this agent go through `scripts/run.sh` against `localhost`, or via `scripts/tunnel.sh`.
+
+## Manual install (source build)
+
 ## Recommended Specs
 
 | Resource | Value | Cost |
@@ -96,7 +127,9 @@ su - trinity -c "
 nano /home/trinity/trinity/.env
 # Set: ADMIN_PASSWORD, SECRET_KEY, MCP_API_KEY, ANTHROPIC_API_KEY
 
-su - trinity -c "cd ~/trinity && docker compose -f docker-compose.prod.yml up -d"
+su - trinity -c "cd ~/trinity && ./scripts/deploy/build-base-image.sh && ./scripts/deploy/start.sh"
+# (start.sh, not a bare `compose up`: it generates the remaining secrets, probes DOCKER_GID,
+#  chowns the data dir and refuses a dev/prod data-store mix-up, #2390)
 ```
 
 ## Configure the ops agent

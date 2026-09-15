@@ -77,6 +77,8 @@ The agent will check:
 ./scripts/run.sh "sudo docker restart trinity-backend"
 ```
 
+**Never `docker compose down` on a Trinity host (v0.9.5, #2541).** Agent containers are now created with `restart: unless-stopped` (constant, not tunable). `down` recreates `trinity-agent-network` with a new id, so every agent then fails `docker start` with `network … not found` and dockerd retries it in a backoff loop — the roster normalises `restarting` to `stopped`, so the fleet reads quiescent while churning. Use `docker compose stop` (upstream's `scripts/deploy/stop.sh` does this and picks the right compose file from the running stack's label). If it already happened: `docker rm -f` the flapping `agent-*` containers (workspace volumes are untouched), then start them via `POST /api/agents/{name}/start` or `POST /api/ops/fleet/restart`.
+
 ### Update Trinity
 
 Pulls the latest code, rebuilds Docker images, restarts services, and verifies health:
@@ -86,6 +88,21 @@ Pulls the latest code, rebuilds Docker images, restarts services, and verifies h
 ```
 
 **v0.9.0 upgrade notes (#1814 / #1809 / #1860 / #1816):** `start.sh` never rebuilds platform images, so an in-place `git pull` leaves the *previous* build running the *new* code. `update.sh` rebuilds the four platform images for you; check `GET /api/version` afterwards — `version` is the code in service, `image_version` the build it runs inside, and **if they differ the image is stale**. The agent **base image** is separate: when `docker/base-image/` changed in the pulled range, run `./scripts/deploy/build-base-image.sh` on the server, then **stop and start** each agent (or Operating Room → Restart All / `/rebuild-agent`). Since v0.9.0 a cold stop/start detects the rebuilt image and recreates the container itself (`recreate_reason: "image_drift"`); a start of an already-*running* agent never image-recreates it. `update.sh` prints a reminder when the pulled range touched the base image.
+
+**v0.9.5 upgrade notes (0.9.0 → 0.9.5):**
+
+1. **`CREDENTIAL_ENCRYPTION_KEY` must be set before the backend boots** (ent#435 / #2330). A one-shot data migration (`secret_settings_encryption` / Alembic `0041`) moves `anthropic_api_key`, `github_pat`, `google_api_key`, `slack_app_token`, `slack_client_secret`, `slack_signing_secret` out of plaintext `system_settings` rows into AES-GCM `<key>_encrypted` envelopes and **deletes the plaintext**. The backend **refuses to boot** (`MissingEncryptionKeyError`) if the key is empty while such rows exist; only installs that never ran `start.sh` can hit this. Afterwards **rotate every credential that was entered via Settings** — old backups and DB free pages still hold the plaintext (VACUUM runs nightly 04:30 UTC). If you ever rotated the key before, re-run `rotate-credential-key.py --apply` once with the old key in `_SECONDARY`: `elevenlabs_api_key_encrypted` and `a2a_outbound_endpoints_encrypted` were never rewrapped by earlier rotations. Runbook on the server: `docs/migrations/SECRET_SETTINGS_ENCRYPTION_2026-08.md`.
+2. **Rebuild the agent base image and cold-recreate every agent.** Agent-side fixes only ship in the image: arm64 native Claude Code binary (#2537, build now *fails* on a stub), guardrail hooks moved to root-owned `/etc/claude-code/managed-settings.json` (ent#345/#2299), pre-installed Trinity plugin (ent#411/#2284), Codex API-key `auth.json` (#2333), wedge diagnostics (#2503), the 11-tool headless deny list (#2476), the sanitizer ReDoS hotfix (#2398, 40s CPU per key on the old image), parked-call `pending_ids` (#2435). After the wave grep agent logs for `GUARDRAILS: ERROR` — a stale image reports it every boot and runs **no** hooks.
+3. **Restart-policy sweep, once** (#2541). Pre-upgrade agent containers keep `RestartPolicy=no` until recreated, so they still die on a host reboot. `docker update --restart unless-stopped` on a *stopped* container changes the policy without starting it:
+   ```bash
+   ./scripts/run.sh "for c in \$(sudo docker ps -a --format '{{.Names}}' | grep '^agent-'); do [ \"\$(sudo docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' \$c)\" = no ] && sudo docker update --restart unless-stopped \$c; done"
+   ```
+   Runbook: `docs/migrations/AGENT_RESTART_POLICY_2026-09.md`. New consequences: "High restart count" operator alerts fire for the first time (a crash loop re-runs `startup.sh` each retry), and a daemon-driven restart skips the start ladder, so a config-drifted agent returns on stale config after a reboot — `POST /api/ops/fleet/restart` re-runs the ladder.
+4. **PostgreSQL: check `alembic heads`.** Revisions `0043` and `0044` briefly forked; `0045` merges them. Two heads ⇒ `alembic upgrade head` applies nothing, silently.
+5. **Platform images:** frontend now builds on `node:26-alpine`; the backend image gains `src/backend/shared_sessions` (rooms moved to OSS core, ent#443 — a custom Dockerfile without that `COPY` dies at import); nginx proxies `/mcp` → `trinity-mcp-server:8080` (#2475). All need the `update.sh` rebuild.
+6. **Retention rows are now seeded for every install at boot** (#2432): each retention key with no `system_settings` row gets one at the value already in force. Inert today, but upgraded installs stop inheriting future code-default changes — widening is a deliberate `PUT /api/settings/ops/config` from now on.
+7. **Hosted (prebuilt-image) installs upgrade by re-running `start.sh --hosted`**, never `docker compose pull` alone — the agent base image is not a compose service (see [Install modes](#install-modes-source-build-vs-hosted-images-2280)).
+8. `GET /api/version` gains `install_source` (#2380); `POST /token` answers a 2FA-deferred login with **403** instead of `200 + access_token: null` (#2357) — see [API Access](#api-access).
 
 ### Backup Database
 
@@ -161,7 +178,15 @@ source .env
 
 # Exec into agent
 ./scripts/run.sh "sudo docker exec -it agent-myagent bash"
+
+# Restart policy census (v0.9.5, #2541) — new agents are unless-stopped; pre-upgrade ones stay `no` until recreated or swept
+./scripts/run.sh "for c in \$(sudo docker ps -a --format '{{.Names}}' | grep '^agent-'); do echo \"\$c \$(sudo docker inspect -f '{{.HostConfig.RestartPolicy.Name}} restarts={{.RestartCount}}' \$c)\"; done"
+
+# Thread dump of a wedged agent server (v0.9.5, #2503) — every thread's stack to the container log, no restart
+./scripts/run.sh "sudo docker exec agent-myagent kill -USR1 1 && sleep 1 && sudo docker logs agent-myagent --tail 200 2>&1 | grep -A40 'THREAD DUMP'"
 ```
+
+**Stopped stays stopped (v0.9.5, #2541).** Agent containers are `restart: unless-stopped`, so they come back after a host reboot or a dockerd restart — *unless* they were stopped deliberately. Both `docker stop` and Trinity's own stop set Docker's manual-stop flag, which `unless-stopped` honours across reboots. Caveat: the flag is set only when the stop *succeeds* — after `POST /api/ops/emergency-stop`, any agent reported as `{"result":"error"}` is still running and will now survive the next reboot; re-issue for it. `always` is deliberately unreachable.
 
 File sharing is disabled per agent by default. Enable it via the Sharing panel in AgentDetail UI, or via API:
 
@@ -217,10 +242,17 @@ Files expire after 7 days. One-time files are consumed on first download.
 source .env
 HOST=${SSH_HOST:-localhost}
 
-# Get admin token
+# Get admin token. `username` must match ADMIN_USERNAME on the server (default admin;
+# prod compose forwards it since #2385, so a value that used to be inert is now live).
+# Since #2357 a 2FA-deferred login answers 403 {"detail":"mfa_required",...} instead of
+# 200 with access_token:null, and a grant carries only access_token + token_type —
+# read `.access_token // empty` and treat empty as failure. An enterprise role-based
+# 2FA policy defers EVERY admin password login before anyone enrols; the machine
+# path is then an MCP API key (`user` scope for writes, `ops` for reads), which
+# never passes the MFA gate.
 TOKEN=$(curl -s -X POST http://$HOST:${BACKEND_PORT:-8000}/token \
   -H 'Content-Type: application/x-www-form-urlencoded' \
-  -d "username=admin&password=$ADMIN_PASSWORD" | jq -r '.access_token')
+  -d "username=admin&password=$ADMIN_PASSWORD" | jq -r '.access_token // empty')
 
 # List agents
 curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api/agents | jq
@@ -228,8 +260,25 @@ curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api
 # Fleet health
 curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api/ops/fleet/health | jq
 
-# Host telemetry (no auth)
-curl -s http://$HOST:${BACKEND_PORT:-8000}/api/telemetry/host | jq
+# Host telemetry (authenticated — SEC-180; the old "no auth" note here was stale)
+curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api/telemetry/host | jq
+
+# Read-only machine credential for dashboards/monitors (#2323/#2389, v0.9.5) — an
+# MCP API key with scope `ops`: GET-only, exact-match route fence (/api/version,
+# /api/ops/fleet/{status,health}, /api/ops/{schedules,alerts,costs,auth-report},
+# /api/monitoring/status, /api/telemetry/{host,containers}, /api/agents, /api/agents/
+# {execution-stats,slots}, /api/agents/{n}/executions[/{id}/stream], /api/executions
+# [/stats], /api/subscriptions[/{id}/usage]); everything else 403, not admitted to
+# /ws/events. Survives enforced 2FA. Bound to its minting owner: demotion/suspension
+# kills it, so mint it under a dedicated service-admin account. HUMAN-only to mint
+# (any MCP key is refused); the secret is returned ONCE.
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  http://$HOST:${BACKEND_PORT:-8000}/api/mcp/keys -d '{"name": "dashboard", "scope": "ops"}' | jq
+#   then: curl -H "Authorization: Bearer $OPS_KEY" .../api/ops/fleet/health
+# Audit rows now carry mcp_key_id / mcp_scope taken from the validated bearer — the
+# forgeable X-MCP-Key-* headers are no longer read anywhere (#2389)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://$HOST:${BACKEND_PORT:-8000}/api/audit-log?mcp_key_id=<id>&limit=50" | jq
 
 # Mint a WebSocket auth ticket (required before opening /ws)
 curl -s -X POST -H "Authorization: Bearer $TOKEN" \
@@ -275,8 +324,13 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 # Version in service vs. image built (#1810/#1814) — `version` is the code
 # executing, `image_version` the build it runs inside; DIFFERENT = stale image,
-# rebuild the platform images (see Update Trinity)
-curl -s http://$HOST:${BACKEND_PORT:-8000}/api/version | jq '{version, image_version, git_commit_short, edition}'
+# rebuild the platform images (see Update Trinity). `install_source` (#2380, v0.9.5)
+# = do-marketplace | vultr-marketplace | do-script | script | unknown, recorded ONCE
+# at first boot from TRINITY_INSTALL_SOURCE and immutable thereafter
+curl -s http://$HOST:${BACKEND_PORT:-8000}/api/version | jq '{version, image_version, git_commit_short, edition, install_source}'
+# Feature flags (any authed user) also carry install_source, marketplace_install,
+# hardening_guide_eligible, install_tls_posture (unconfigured|http|https-ip|https-domain)
+curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api/settings/feature-flags | jq
 
 # Admin recovery for soft-deleted agents/schedules (#834)
 curl -s -H "Authorization: Bearer $TOKEN" \
@@ -291,8 +345,99 @@ curl -s http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/a2a/agent-card | j
 # ABSORBED into Workspace in v0.9.0 (#2120 / ent#358; the Sessions page and its
 # nav entry are retired, ent#381): the endpoints still exist and still work, but
 # the surface lives inside Workspace chats (`?tab=session` redirects to /workspace).
+# Still mounted (gated on SESSION_TAB_ENABLED, opt-out only); the Workspace-native
+# sessions API is the separate /api/enterprise/client-portal/agents/{name}/sessions
+# family (v0.9.5: PATCH rename, POST .../sessions/main/reset).
 curl -s -X POST -H "Authorization: Bearer $TOKEN" \
   http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/session | jq
+
+# Operator answer wakes a parked agent (ent#329 / #2312, v0.9.5) — an agent that
+# wrote an operator-queue ask and EXITED only sees the answer on its next turn
+# (never, for a one-shot agent). Per-agent opt-in, default OFF, costs a run per
+# answer (`triggered_by: operator_response`; audit operator_resume_config/_dispatch).
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/operator-resume | jq
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/operator-resume -d '{"enabled": true}' | jq
+
+# Operator-queue respond (#2376, v0.9.5): for an `approval` item with `options`, the
+# `response` must EXACTLY match one offered option (case-sensitive) — else 422
+# carrying `offered_options`. Send "Approve", not "approved".
+
+# Fan-out batch poll (#2670/#2679, v0.9.5) — `fan_out` now answers with a fan_out_id
+# (sync chat_with_agent answers `queued_timeout` + execution_id instead of a bare
+# `fetch failed` on a gateway abort, #2661; ceilings MCP_CHAT_TIMEOUT_MS / _RECOVERY_)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/fan-out/<fan_out_id> | jq
+#   status running|completed|partial|failed, counts, results[]
+
+# Subscription usage observability (#471/#2316, ent#433/#434, v0.9.5) — 5h/7d headroom,
+# per-agent breakdown, durable probe history (subscription_headroom_history),
+# pressure badges, background sweep (SUBSCRIPTION_SWEEP_CONCURRENCY). Since #2354/
+# #2396/#2362 an auth failure or the provider's warning tier is NOT reported as
+# rate-limited, and a limited subscription is re-probed every 300s for recovery.
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/subscription-pressure | jq   # incl. auth_failures_24h, token_status
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/subscriptions/<id>/usage/breakdown | jq
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/subscriptions/<id>/usage/refresh | jq   # force a probe (15-min floor, single-flight)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://$HOST:${BACKEND_PORT:-8000}/api/subscriptions/<id>/headroom/history?window=7d" | jq   # 24h|7d|30d
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  http://$HOST:${BACKEND_PORT:-8000}/api/subscriptions/test -d '{"token": "..."}' | jq   # validate before registering
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/subscriptions/settings/headroom-auto-refresh | jq   # GET/PUT; gates the ambient sweep
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/subscriptions/settings/api-key-fallback | jq        # GET/PUT; default ON — fall back to the platform key when no subscription can serve (#2645)
+#   PUT /api/subscriptions/settings/headroom-alert-threshold — weekly-window alarm %, default 75, 0 disables (ent#434)
+#   Headroom alarms file under sentinel `_sub-headroom` (ids sub-headroom-*).
+#   #2741: on an instance with NO ANTHROPIC_API_KEY, registering a subscription (or
+#   deleting the instance key) auto-assigns it to every api_key-mode Claude agent and
+#   restarts them in the background — expect a restart wave.
+
+# Platform API keys via the encrypted path (ent#435/#582, v0.9.5) — DB row wins over
+# env, no restart; DELETE clears and reports whether an env fallback remains. The
+# generic PUT /api/settings/{key} now 422s any credential-shaped key (#2330).
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  http://$HOST:${BACKEND_PORT:-8000}/api/settings/api-keys/gemini -d '{"api_key": "..."}' | jq
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/settings/api-keys/gemini/test | jq
+#   same shape for /api-keys/resend (PUT body also takes from_address; selects Resend as the email provider)
+
+# Operator-intake consent home (ent#463/#2418) + telemetry consent-card dismiss (#2516)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/settings/operator-intake | jq          # GET/PUT (PUT human-only); enabled=false = durable decline
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/settings/telemetry-sharing/ask/dismiss | jq
+#   GET /api/settings/telemetry-sharing?preview=1 now also reports receiver_host /
+#   configured_host / receiver_mismatch / recent_sends (#2706)
+
+# Multi-agent rooms — OSS core since v0.9.5 (ent#443/#2355). Budget defaults are
+# system_settings rows, not env (code defaults 200 msgs / no cost cap / 168 h TTL;
+# ceilings 500 / 168 h). A room that hits max_messages or expires closes
+# PERMANENTLY (410 room_closed). Admin + human-only.
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/enterprise/room-budget-defaults | jq   # GET/PUT (partial; `clear:[...]` unsets); `sources` = db-row vs code-default
+
+# Agent canvases (ent#438/#553/#554, v0.9.5) — durable per-agent canvases written by
+# the set_canvas / patch_canvas MCP tools (needs the rebuilt mcp-server image). Cap
+# CANVAS_MAX_PER_AGENT (409 on INSERT, never evicts). Share links are LIVE views —
+# revoke to stop drift; public read GET /api/public/canvas/{token} (410 revoked/expired).
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/canvas | jq
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/canvas/shares | jq       # owner/admin, human-only
+curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/canvas/shares/<share_id> | jq
+#   audit actions canvas_share / canvas_share_public / canvas_share_revoke / canvas_pin / canvas_delete / canvas_bulk_delete
+
+# Systems post-deploy (#2373, v0.9.5): restart is creator-tier + HUMAN-only (agent keys
+# 403); GET /api/systems/{name} now returns schedules projected WITHOUT webhook
+# tokens (a brief leak); membership is tag-first with prefix fallback (a tag-read
+# failure degrades to prefix OVER-capture with a WARNING).
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/systems/<name>/restart | jq
 
 # Fleet executions dashboard (#18 / #852) — list + summary stats
 curl -s -H "Authorization: Bearer $TOKEN" \
@@ -556,7 +701,14 @@ Key tables:
 | `enterprise_connectors` | Per-agent MCP connector state (#1555, "Expose via MCP") — enabled flag + exposed playbooks; table name kept for compatibility |
 | `skill_sources` | Multi-source skills library (#1901) — one row per library source (bundled community repo + per-instance custom repos). `agent_skills.source_id` names which source a skill came from |
 | `agent_evaluations` | Behavioral evaluations (#1752) — referee verdicts over completed executions; read via `/api/evaluations` |
-| `enterprise_portal_sessions` / `enterprise_portal_messages` / `enterprise_portal_chat_state` / `enterprise_client_blocks` | Workspace / client portal (#2084) — **OSS core**, not entitled. Client sessions (sliding idle+absolute windows, #2099), thread messages, per-chat star/unread state, and per-agent client blocks. `enterprise_` prefix kept for compatibility |
+| `enterprise_portal_sessions` / `enterprise_portal_messages` / `enterprise_portal_chat_state` / `enterprise_client_blocks` | Workspace / client portal (#2084) — **OSS core**, not entitled. Client sessions (sliding idle+absolute windows, #2099), thread messages, per-chat star/unread state, and per-agent client blocks. `enterprise_` prefix kept for compatibility. v0.9.5 columns: sessions `is_main` / `archived_at` (pinned Main chat, ent#523) / `title_source`; messages `source` (`voice`) / `voice_call_id` (ent#534) |
+| `enterprise_rooms` / `enterprise_room_participants` / `enterprise_room_messages` | Multi-agent rooms — **OSS core since v0.9.5** (ent#443 / #2355; Alembic `0044` + merge `0045`). `status open\|closed`, `stop_reason max_messages\|expired\|user_closed`, per-room `max_messages` / `max_cost_usd` / `expires_at`. No `deleted_at` and **no retention sweep** — closed rooms persist; agent purge cascades |
+| `agent_canvases` / `agent_canvas_shares` | Agent canvases (ent#438/#553/#554, v0.9.5) — per-agent `blocks` JSON, `audience`, `template`, `pinned`; share links with `token`, `scope authorized\|public`, `expires_at`, `revoked_at`, `view_count`. Written by the `set_canvas`/`patch_canvas` MCP tools; capped by `CANVAS_MAX_PER_AGENT`. No sweep of expired/revoked shares |
+| `subscription_headroom_history` | One row per subscription-headroom probe (ent#433, v0.9.5) — 5h/7d utilisation for trends. Pruned by the new ops key `subscription_headroom_retention_days` (30) |
+| `portal_file_dismissals` | Per-viewer "remove from my list" of an `agent_shared_files` row in the Workspace (#2582, v0.9.5) |
+| `user_ui_preferences` | Per-user server-side UI state — Dashboard grid layout, tile prefs (ent#413 / #2561, v0.9.5); replaces localStorage. `GET/PUT/DELETE /api/users/me/preferences[/{key}]` |
+
+**v0.9.5 columns worth knowing:** `agent_ownership.operator_resume_enabled` (#2312, default 0), `schedule_executions.turn_integrity` (#2467 — JSON `background_tasks_killed` / `_pending_at_exit`; **NULL = no evidence, not healthy**), `schedule_executions.open_canvas_id` / `source_channel_client`, `agent_schedules.deliver_to_workspace_email` (ent#498 — a refused delivery **fails the run**), `agent_loops.next_run_at` / `stop_requested_at` (#2523 — loops are terminal-driven rows that survive a backend restart; no more `interrupted` on boot), `operator_queue.addressed_to_email` and `agent_reports.addressed_to_email` / `portal_session_id` (ent#364/#365 — asks and reports addressed to a Workspace client), `subscription_rate_limit_events.failure_kind` (429 vs auth, #471), `agent_evaluations.target_kind` / `target_id` / `comment` (Workspace ratings, ent#366 — comments are redacted for every non-human principal). Alembic head at 0.9.5-rc3: `0061_execution_open_canvas`. **Data migration `0041_secret_settings_encryption`** rewrites six credential rows into `<key>_encrypted` envelopes and deletes the plaintext — see [Update Trinity](#update-trinity).
 
 **Channel columns (#2 channels wave):** `telegram_bindings.progress_indicator_enabled` (per-binding in-flight reaction ack, default 1), `telegram_group_configs.allow_proactive` (per-group proactive send consent, default 1), and `schedule_executions.source_channel_agent` (which channel-bound agent originated a run, for completion report-back).
 
@@ -578,14 +730,44 @@ Trinity runs on any Linux VM with Docker. Choose your provider:
 
 All guides provision Ubuntu 24.04 with Docker via cloud-init, then walk you through installing Trinity and pointing this ops agent at the instance.
 
+**DigitalOcean shortcut (v0.9.5, #2380/#2707):** upstream now ships a one-command path run from *your* machine — it creates an `s-4vcpu-8gb` Ubuntu 24.04 droplet via `doctl`, injects user-data that runs `start.sh --provision --cloud digitalocean --hosted --unattended`, and waits for HTTPS on the droplet's IP (Caddy with a Let's Encrypt IP certificate, ufw 22/80/443 only, a Docker firewall that blocks the metadata service from containers). Admin is pre-provisioned from the prompt, so there is no browser-claim window.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/abilityai/trinity/<tag>/scripts/deploy/trinity-do-create.sh)
+#   prompts: admin password ×2, Claude token, region, name. Needs `doctl auth init` first.
+#   The default TRINITY_IMAGE_TAG is baked into the script at that tag.
+```
+
+On the droplet, Trinity lives in `/opt/trinity`, the frontend listens on `FRONTEND_PORT=8081` behind Caddy, and a custom domain is added by saving the Public URL in Settings → General plus an A record (Caddy's on-demand TLS asks `GET /api/public/tls-allowed?domain=` — 200 only for that exact host). Point this ops agent at it with `SSH_USER=root`, `TRINITY_PATH=/opt/trinity`, `COMPOSE_FILE=docker-compose.hosted.yml`, `FRONTEND_PORT=8081`.
+
 ### Minimum Server Requirements
 
 | Resource | Minimum | Recommended |
 |----------|---------|-------------|
 | CPU | 1 vCPU | 2 vCPU |
-| RAM | 2 GB | 4 GB |
+| RAM | 2 GB (source build) · **8 GB for `--hosted`** (start.sh enforces it) | 4 GB+ |
 | Disk | 20 GB | 50 GB |
 | OS | Ubuntu 22.04+ | Ubuntu 24.04 |
+
+### Install modes: source build vs hosted images (#2280)
+
+Since v0.9.5 there are **three standalone compose stacks**, and they must never be layered on each other (#2528/#2557):
+
+| Stack | Command | Images | Data store |
+|-------|---------|--------|------------|
+| **dev** | `docker compose up -d` (+ auto override) | built locally | named volume `trinity_trinity-data` |
+| **prod** | `docker compose -f docker-compose.prod.yml up -d` (+ `-f docker-compose.prod.enterprise.yml`) | built locally (`update.sh`) | bind mount `${TRINITY_DATA_PATH:-./trinity-data}` |
+| **hosted** | `./scripts/deploy/start.sh --hosted` → `docker-compose.hosted.yml` | pulled from `ghcr.io/abilityai/trinity-{backend,frontend,scheduler,mcp-server}:${TRINITY_IMAGE_TAG}` | bind mount, as prod |
+
+`-f docker-compose.yml -f docker-compose.prod.yml` is **wrong**: Compose merges list keys by concatenation, so Compose ≥ 2.24 fails on the duplicated `group_add` and older Compose silently doubles the frontend `ports` (host→80 *and* host→8080), after which nginx crash-loops on `host not found in upstream`. `start.sh` also **refuses** to bring a dev-stack database up under prod/hosted (or vice versa) and warns when both stores exist, printing the `alpine cp -a` recipe to move data across — a bare `docker compose up -d` on a prod host otherwise boots an empty DB on a healthy-looking backend.
+
+**Hosted specifics:**
+- `start.sh --hosted [--unattended]` pulls the four platform images **and** `ghcr.io/abilityai/trinity-agent-base:$TRINITY_IMAGE_TAG`, retagging it `trinity-agent-base:latest`. It is also the **upgrade** command: a plain `docker compose pull` leaves every agent on the old runtime, and a bare `docker compose -f docker-compose.hosted.yml up -d` on a fresh box starts a platform that cannot create agents (no local base image). No fallback to a local build — `manifest unknown` = wrong tag, `denied` = the GHCR package is not public (report upstream, do not `docker login` around it).
+- **Pin `TRINITY_IMAGE_TAG` in `.env`.** Each release publishes `vX.Y.Z`, `X.Y.Z`, `X.Y`, `latest` and `sha-<short>` for one digest; a pre-release tag (`v0.9.5-rc3`) publishes only its own spellings and **never moves `latest`** (#2499). Unpinned, the next `start.sh --hosted` is an unscheduled upgrade.
+- The repo checkout is still required: the hosted file bind-mounts `./config/*`; without it Docker silently creates empty dirs → empty template catalog, no starter fleet.
+- `TUNNEL_TOKEN` set ⇒ `start.sh --hosted` appends `--profile tunnel` and persists `COMPOSE_PROFILES=tunnel` to `.env`. On prod/dev, `cloudflared` is profile-gated too and needs the flag (or `COMPOSE_PROFILES=tunnel`) by hand.
+- `quickstart.sh` is now a pure alias for `start.sh` (`--defaults` → `--unattended`); `scripts/deploy/stop.sh` runs `compose stop` (never `down`) and detects a hosted stack from the `com.docker.compose.project.config_files` label on `trinity-backend`.
+- Published images are OSS-only and amd64-only; the publish workflow is `.github/workflows/publish-images.yml`.
 
 ### Installing Trinity on a Fresh Server
 
@@ -631,9 +813,11 @@ Everything else (`SECRET_KEY`, `CREDENTIAL_ENCRYPTION_KEY`, `INTERNAL_API_SECRET
 curl http://localhost:8000/health
 ```
 
-**Unattended install (#1708):** `./scripts/deploy/start.sh --unattended` (or `TRINITY_UNATTENDED=1`) removes the interactive hard-stops — a missing `ADMIN_PASSWORD` is auto-generated and printed in the end-of-run summary instead of blocking on a prompt. Use for scripted/agent-driven installs.
+**Unattended install (#1708):** `./scripts/deploy/start.sh --unattended` (or `TRINITY_UNATTENDED=1`) removes the interactive hard-stops — a missing `ADMIN_PASSWORD` is auto-generated and printed in the end-of-run summary instead of blocking on a prompt (and since #2385 that printed password actually works). Use for scripted/agent-driven installs. An `ADMIN_PASSWORD` present in the *environment* is written through to `.env` (never overwriting an existing one, #2707).
 
-On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you to set your admin password and configure API keys. After first-time setup, a genuinely fresh install auto-deploys a bundled starter fleet once (#1764); set `TRINITY_DEFAULT_SYSTEM_MANIFEST=disabled` beforehand to skip it, or point it at your own manifest file.
+**Provisioning a bare VM in place (v0.9.5, #2707):** `sudo ./scripts/deploy/start.sh --provision --cloud digitalocean [--machine-only|--site-only] [--hosted --unattended]` installs Docker CE, Caddy (pinned 2.11.4, floor 2.11.3 for IP certificates), ufw (22/80/443), the `trinity-docker-firewall.service` (drops container traffic to `169.254.0.0/16` and every off-box path to a published port), writes `FRONTEND_PORT=8081` / `FRONTEND_URL=https://<ip>` / `TRINITY_INSTALL_SOURCE=do-script`, waits ~150s for a real certificate (`/etc/trinity/tls-status`, `journalctl -u caddy`), then continues into the normal install. It **refuses unless root + Linux + the DO metadata service answers**, so it is inert on a laptop. Only `--cloud digitalocean` exists today.
+
+On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you to set your admin password and configure API keys. Since #2385 the wizard's `POST /api/setup/admin-password` **refuses when a usable admin already exists**, so an install booted with `ADMIN_PASSWORD` set never shows the claim step (see [Browser admin claim](#browser-admin-claim-on-marketplace-images-ent580--2715)). After first-time setup, a genuinely fresh install auto-deploys a bundled starter fleet once (#1764); set `TRINITY_DEFAULT_SYSTEM_MANIFEST=disabled` beforehand to skip it, or point it at your own manifest file.
 
 **Outbound egress on a default install (#2033):** the agent-template catalog fetches a vendor-published `registry.yaml` at runtime, and `TEMPLATE_REGISTRY_ENABLED` defaults to **true**. It sends nothing about the operator (it is a package-index read, like npm or Homebrew) and is deliberately *not* covered by `DO_NOT_TRACK`, but it is still a network call. For air-gapped or policy-strict installs set `TEMPLATE_REGISTRY_ENABLED=false` before first start — that is a hard kill switch no admin toggle or DB row can override. Curating your own GitHub template list in Settings also suppresses the fetch entirely.
 
@@ -644,7 +828,7 @@ On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you 
 | Container | Port (host:container) | Purpose |
 |-----------|----------------------|---------|
 | `trinity-backend` | 8000:8000 | FastAPI REST API — runs as UID 1000 (#874). Image bakes `postgresql-client-17` since v0.9.0 (#2216) for the nightly `pg_dump` arm — major-pinned so an unrelated rebuild can never move it; a PG server major above 17 fails the backup **loudly** (operator alarm), never silently |
-| `trinity-frontend` | 80:8080 | Vue.js Web UI — unprivileged nginx (#874) |
+| `trinity-frontend` | `${FRONTEND_PORT:-80}`:8080 | Vue.js Web UI — unprivileged nginx (#874). Host port honours `FRONTEND_PORT` in prod/hosted since v0.9.5 (#2390; was hard-coded 80). nginx also proxies **`/mcp` → `trinity-mcp-server:8080`** (#2475) so an 80/443-only install (Caddy in front) still serves MCP at `https://<host>/mcp`. Builds on `node:26-alpine` |
 | `trinity-mcp-server` | 8080:8080 | MCP Protocol Server |
 | `trinity-scheduler` | 8001:8001 | Scheduled tasks — runs as UID 1000 |
 | `trinity-redis` | 6379:6379 | Sessions, credentials, WS auth tickets — ACL-protected, two users (#589) |
@@ -652,7 +836,10 @@ On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you 
 | `trinity-logs-init` | — | One-shot `alpine` init (#1478): `chown 1000:1000 /data/logs` so UID-1000 Vector retention can write. Backend `depends_on` it (`service_completed_successfully`); exits immediately, `restart: no` |
 | `trinity-archives-init` | — | **Dev compose only** — the missed sibling of `logs-init` (#2205, v0.9.0): `chown 1000:1000 && chmod 775 /data/archives` on the named `trinity-archives` volume, which Docker creates root-owned, so the UID-1000 backend could never write it and log archival died silently on every run. Runs on every `up` (repairs existing installs, idempotent); backend `depends_on` it. **Prod needs none**: `/data/archives` lives inside the `${TRINITY_DATA_PATH}` bind mount that `start.sh` chowns recursively |
 | `trinity-postgres` | 5432:5432 | **Optional** PostgreSQL backend (#300) — dev-compose only, behind `--profile postgres`. Off by default (SQLite). See [Database Backend](#database-backend-sqlite-default--postgresql-300). |
-| `agent-{name}` | — | Per-agent isolated containers |
+| `trinity-cloudflared` | — | Cloudflare Tunnel — **profile-gated** (`--profile tunnel` / `COMPOSE_PROFILES=tunnel`) in every stack; only `start.sh --hosted` activates it automatically when `TUNNEL_TOKEN` is set |
+| `agent-{name}` | — | Per-agent isolated containers — `restart: unless-stopped` since v0.9.5 (#2541; pre-upgrade containers keep `no` until recreated or swept) |
+
+**Restart policies (#2541, v0.9.5):** every platform service is `restart: unless-stopped` in all three stacks (the dev file gained it for backend/frontend/redis — before that a self-hosted control plane did not survive a host reboot either). Agents get the same policy at create/recreate, baked unconditionally (a recreate normalises, it does not carry the old value forward). A daemon-driven restart bypasses `start_agent_internal` (drift predicates, MCP-key self-heal, credential injection), so involuntary reboots are no longer a free fleet-wide cold-start boundary — base-image adoption happens on a Trinity-initiated stop/start or `POST /api/ops/fleet/restart`.
 
 **Container log rotation (#1871):** Docker's `json-file` driver has **no** size cap by default, so every container log under `/var/lib/docker/containers/` grew forever — silently, until the Docker data root filled and dockerd wedged. Two mechanisms, because the two container kinds are created two different ways:
 
@@ -683,7 +870,7 @@ Both the backend and the standalone scheduler read the same `DATABASE_URL`, so t
 - **Dev `docker-compose.yml`** bundles a `postgres:16-alpine` service (container `trinity-postgres`) gated behind the `postgres` **compose profile**. Enable with `POSTGRES_PASSWORD` set, then `docker compose --profile postgres up -d`.
 - **Prod `docker-compose.prod.yml` ships NO postgres service.** A `postgresql://` URL in prod must point at an **operator-managed** PostgreSQL (RDS, Cloud SQL, a separate VM). The backend/scheduler/agent containers must be able to reach that host:port.
 
-**On first (cold) start** against an empty Postgres, the backend runs `alembic upgrade head` — the `0001_baseline` revision builds the ~61 base tables plus append-only audit-log triggers, the incremental revisions on top of it (30+ as of v0.8.5, e.g. `agent_reminders`, `product_events`) bring the schema to head, then the admin user is seeded from `ADMIN_PASSWORD`. The instance starts in first-run setup (`setup_required` on login is expected, not an error). Alembic owns the PG schema; **SQLite keeps its separate `db/migrations.py` runner** — the two coexist during the transition.
+**On first (cold) start** against an empty Postgres, the backend runs `alembic upgrade head` — the `0001_baseline` revision builds the ~61 base tables plus append-only audit-log triggers, the incremental revisions on top of it (`0061_execution_open_canvas` is head at 0.9.5-rc3) bring the schema to head, then the admin user is seeded from `ADMIN_PASSWORD`. **Check `alembic heads` after an upgrade**: revisions `0043` and `0044` forked briefly and `0045` merges them — with two heads, `alembic upgrade head` applies nothing and says nothing (`docker exec trinity-backend alembic heads`). The instance starts in first-run setup (`setup_required` on login is expected, not an error). Alembic owns the PG schema; **SQLite keeps its separate `db/migrations.py` runner** — the two coexist during the transition.
 
 **Migrating an existing SQLite instance:** upstream's `init_database()` only *bootstraps* a fresh PG DB — it has no SQLite→PG data copy. This ops agent ships the **`/migrate-to-postgres`** skill (`.claude/skills/migrate-to-postgres/`) to close that gap: it stands up Postgres alongside the running instance, trial-copies + validates the data via a dialect-aware ETL, then cuts over in a short downtime window with one-line rollback (the SQLite file is never written). Gated at every state-changing step.
 
@@ -717,6 +904,35 @@ Further hardening is tracked in [`abilityai/trinity#1523`](https://github.com/ab
 ### Admin gates reject agent-scoped principals (v0.9.0, ent#297)
 
 `require_admin` / `assert_admin` now refuse **any agent-scoped MCP key**, even one owned by an admin. Before this, an admin-owned agent's `TRINITY_MCP_API_KEY` was admin on every admin-gated route (~114 of them) — the root cause of four prior escalations, including a fleet-wide prompt-injection path via `PUT /api/settings/skills_library_url` (ent#293/#346). **If automation drove admin endpoints with an *agent's* key, it now 403s — switch it to a user-scoped key** (`/api/settings/api-keys`). Agent self-check flows (heartbeat, reports, result callbacks, `set_reminder`, `report`) are unaffected. This is the general rule behind the per-endpoint "human-only" notes elsewhere in this file.
+
+### Machine credentials, attribution, and the `ops` key scope (v0.9.5, #2323 / #2389 / ent#614)
+
+- **Admin gates are now an allowlist.** `require_admin` / `assert_admin` accept only scopes `None` (a password JWT), `user` and `system`; every other MCP-key scope — `agent`, `connector`, `portal_delegate`, the new `ops`, anything invented later — is refused, and a principal with no scope attribute fails closed. The ops agent's `POST /token` → bearer flow is unchanged; existing `user`-scoped admin keys are not narrowed.
+- **`ops` scope** is a bounded, read-only machine credential for dashboards and monitors: GET-only, exact-match route fence (listed under [API Access](#api-access)), admitted nowhere else, not on `/ws/events`. It survives enforced 2FA but **dies with its owner** (demotion or `suspended_at`) — mint it under a dedicated service-admin account and treat re-minting as part of offboarding.
+- **Audit attribution comes from the validated bearer.** `X-MCP-Key-Id` / `X-MCP-Key-*` are no longer read by any route (they were forgeable and were persisted into `backlog_metadata`, `schedule_executions`, `agent_loops`, `agent_reminders`). `audit_log` gains `mcp_key_id` / `mcp_scope` filters. A2A idempotency moved from `a2a:{agent}:{username}` to `a2a:{agent}:{key_id}` — a `messageId` replayed across the upgrade re-executes once.
+- **`X-Source-Agent` is honoured only for an agent-scoped key naming itself** (or the backend-vouched event loopback). Any other principal sending it gets **403** on `/chat`, `/task`, `/fan-out`, loops, reminders and manual schedule triggers (ent#614/#2788) — drop the header from user-key or JWT integrations.
+- `/ws` now filters live fan-out and replay by the client's accessible agents, failing closed; admins short-circuit (ent#467/#2483).
+
+### Secret settings encrypted at rest (v0.9.5, ent#435 / #2330)
+
+Six `system_settings` credential rows (`anthropic_api_key`, `github_pat`, `google_api_key`, `slack_app_token`, `slack_client_secret`, `slack_signing_secret`; `resend_api_key` and the Gemini key use the same path from birth) are stored as AES-256-GCM envelopes under `<key>_encrypted`; the cleartext row is **deleted** by a one-shot, idempotent migration at first boot on the new code (SQLite runner `secret_settings_encryption` / Alembic `0041`). The read path also lazily migrates cleartext it finds (a restored old backup, a rollback-then-forward). Consequences:
+
+- **Boot refuses** (`MissingEncryptionKeyError`, names ent#435) when `CREDENTIAL_ENCRYPTION_KEY` is empty and rows need encrypting; cleartext is preserved until you set the key.
+- **Key loss now also destroys these platform credentials** (plus `elevenlabs_api_key_encrypted`, `a2a_outbound_endpoints_encrypted`). Env-var fallbacks (`ANTHROPIC_API_KEY`, `GITHUB_PAT`, `GOOGLE_API_KEY`, `SLACK_*`) still resolve after the encrypted row.
+- **Write guard at the sink:** `db.set_setting` → **422** for any registered secret key *or* any `*_api_key|*_token|*_secret|*_pat|*_password|*_credentials` key, including via the generic `PUT /api/settings/{key}`; use the dedicated `/api/settings/api-keys/*` and Slack routes. A blank write unsets rather than storing an empty envelope.
+- **The migration is not the remediation** — historical backups and DB free pages still hold plaintext; rotate every credential that was ever entered via Settings. Verify: `SELECT key FROM system_settings WHERE key IN ('anthropic_api_key','github_pat','google_api_key','slack_app_token','slack_client_secret','slack_signing_secret')` → no rows.
+
+### Browser admin claim on marketplace images (ent#580 / #2715)
+
+A DigitalOcean 1-Click droplet boots with **no admin**: `ADMIN_PASSWORD` is blank and `ADMIN_PASSWORD_SOURCE=browser` (written only by the marketplace image's first `start.sh --hosted`), and the first visitor to `https://<ip>` creates the admin at `/setup`. Anyone who finds the IP first can squat it — an accepted risk (2026-09-10). Mitigations: open it right after creation (~90s first boot), cloud-firewall 443 to your IP until claimed (leave 80 for ACME), or supply the password at create time via `#cloud-config write_files` → `/etc/trinity/admin-password`. A never-opened droplet that shows a **login** page instead of **create admin** was claimed by someone else — destroy and recreate. On a claimed droplet `.env` keeps `ADMIN_PASSWORD` blank on purpose; **forgotten-password recovery** = set `ADMIN_PASSWORD` in `/opt/trinity/.env` and re-run `start.sh --hosted`. `docker-compose.prod.yml` keeps `${ADMIN_PASSWORD:?}` (refuses blank), and the backend 403s a blank-password claim unless the source is `browser` — never set `ADMIN_PASSWORD_SOURCE=browser` on a hand-run install. `/setup` also refuses whenever a usable admin exists (#2385), and `POST /api/auth/email/verify` re-checks the allow-list before redeeming a code.
+
+### Guardrail hooks live outside the agent's reach (ent#345 / #2299)
+
+Guardrail hook registration moved from the agent-writable `~/.claude/settings.json` to root-owned, mode 0444 `/etc/claude-code/managed-settings.json` in the **base image**. `startup.sh` asserts it every boot and logs `GUARDRAILS: registration verified` or `GUARDRAILS: ERROR — … MISSING` / `… WRITABLE by the agent user`; it reports and continues, and in the ERROR state **no hooks run**. A legacy in-tree copy on the home volume is removed only on an exact `cmp` match. Needs the rebuilt base image plus a cold recreate; grep agent logs for `GUARDRAILS:` afterwards. No `/health` signal yet. The `.claude/settings*` entry in [Protected Files](#protected-files) still applies to the API write paths.
+
+### Provisioned hosts: firewall and metadata service (#2707 / #2522)
+
+`start.sh --provision` installs `trinity-docker-firewall.service`, which populates a `TRINITY-FW` chain jumped from `DOCKER-USER`: RELATED/ESTABLISHED return → **DROP** container traffic to `169.254.0.0/16` (the cloud metadata service — a `trinity-do-create.sh` droplet's user-data carries the admin password and Claude token verbatim for the life of the machine, so agents must not be able to read it) → return from `docker0`/`br+` → DROP everything else. Inverted rule: **no Docker-published port is reachable off-box**, whatever the port; Caddy on 80/443 is the only public surface. IPv4 only; re-applied on every boot. ufw and `iptables-persistent` must never coexist (apt removes ufw). `GET /api/public/tls-allowed?domain=` is the whole on-demand-TLS security model: it answers 2xx for exactly the host of the saved Public URL and 404 otherwise, failing closed.
 
 ### Access-control tightening (CSO 2026-08-09, #2081)
 
@@ -763,7 +979,7 @@ Existing prod deployments must follow `docs/migrations/REDIS_AUTH.md` before upg
 `CREDENTIAL_ENCRYPTION_KEY` encrypts all stored OAuth/MCP/subscription credentials — losing it is unrecoverable, so it's normally set once and never touched. When you *must* rotate it (suspected exposure), the DB still holds ciphertext under the old key, so you need a two-key window:
 
 1. Put the **new** key in `CREDENTIAL_ENCRYPTION_KEY` and the **previous** key in `CREDENTIAL_ENCRYPTION_KEY_SECONDARY` (decrypt-only fallback).
-2. Run `scripts/deploy/rotate-credential-key.py --apply` on the server — it re-encrypts every stored credential under the new key.
+2. Run `scripts/deploy/rotate-credential-key.py --apply` on the server — it re-encrypts every stored credential under the new key. Since v0.9.5 (#2330) that includes a row-keyed `system_settings` pass over every `*_encrypted` platform credential (membership derived from `ENCRYPTED_SETTING_KEYS`). **If you rotated before v0.9.5, run `--apply` once more after upgrading** while the old key is still in `_SECONDARY` — `elevenlabs_api_key_encrypted` and `a2a_outbound_endpoints_encrypted` were never rewrapped by earlier rotations.
 3. Remove `CREDENTIAL_ENCRYPTION_KEY_SECONDARY` and restart.
 
 Leave `CREDENTIAL_ENCRYPTION_KEY_SECONDARY` empty in normal operation. Full guide on the server: `docs/migrations/CREDENTIAL_KEY_ROTATION.md`.
@@ -810,6 +1026,71 @@ Network reference issue — remove and recreate:
 ./scripts/run.sh "sudo docker restart trinity-backend"
 # Then start via UI or API
 ```
+
+Since v0.9.5 the usual cause is a **`docker compose down`** (#2541): agents are `unless-stopped`, the network id changed, and dockerd is retrying each of them in a backoff loop (`docker ps -a` shows `Restarting`, logs say `network … not found`) while the roster shows them *stopped*. `docker rm -f agent-*` (volumes survive), then `POST /api/agents/{name}/start` or `POST /api/ops/fleet/restart`; use `compose stop` next time.
+
+### Agents did not come back after a host reboot
+
+Issue #2541 (v0.9.5) — only containers created on ≥ 0.9.5 carry `unless-stopped`; older ones are still `RestartPolicy=no` until recreated.
+
+```bash
+./scripts/run.sh "for c in \$(sudo docker ps -a --format '{{.Names}}' | grep '^agent-'); do echo \"\$c \$(sudo docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' \$c)\"; done"
+# fix — safe on a stopped container, does not start it
+./scripts/run.sh "for c in \$(sudo docker ps -a --format '{{.Names}}' | grep '^agent-'); do [ \"\$(sudo docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' \$c)\" = no ] && sudo docker update --restart unless-stopped \$c; done"
+```
+
+A new **"High restart count"** / "restarting frequently" operator alert after this change is real, not a false positive — `RestartCount` only increments under a policy; read `docker logs agent-x` for the early exit (OOM, bad env, image regression). An agent that returned from a daemon restart on stale config is fixed by `POST /api/ops/fleet/restart` (runs the start ladder).
+
+### Backend refuses to boot after upgrade — `MissingEncryptionKeyError` / ent#435
+
+`CREDENTIAL_ENCRYPTION_KEY` is empty in the server `.env` on an install that has credentials configured via Settings, and the v0.9.5 secret-settings migration (#2330) will not encrypt without a key. Set it (`openssl rand -hex 32`), restart; the cleartext rows are untouched until then. Then rotate the affected credentials — see [Secret settings encrypted at rest](#secret-settings-encrypted-at-rest-v095-ent435--2330). Related: `PUT /api/settings/{key}` answering **422 "secret setting"** means the key is credential-shaped — use `/api/settings/api-keys/*`.
+
+### `POST /token` returns 403 `mfa_required` / 401 after an upgrade
+
+- **403 with `mfa_required`** (#2322/#2357): an enterprise role-based 2FA policy is on and defers every admin password login before enrolment. Enrol the admin, or move automation to an MCP API key (`user` scope for writes, `ops` for reads) which bypasses the MFA gate.
+- **401 with the right password**: `grep ADMIN_USERNAME ~/trinity/.env` — prod compose forwards it since #2385, so a previously inert value is now the real username.
+- **An MCP key 403s on an admin route it used to reach**: scope is not `user`/`system` (#2389); `ops` only reaches its GET allowlist, and an `ops` key whose owner was demoted or suspended is dead — re-mint under a service admin.
+- **`/chat` or `/task` 403 mentioning `X-Source-Agent`**: a non-agent principal is sending that header (ent#614) — remove it.
+
+### `start.sh --hosted` fails, or agents stay on the old runtime after a pull
+
+- **`could not pull … manifest unknown`**: `TRINITY_IMAGE_TAG` names a tag that was never published — use a release tag (`v0.9.5` / `0.9.5`); `denied` / `unauthorized` means the GHCR package is private (report upstream).
+- **"dev-stack database that --hosted cannot see" / "bind-mounted database that the dev stack cannot see" / "Two databases found"**: `start.sh`'s store guard (#2390). Bring the stack up with the file set it was installed with, or move the data with the printed `alpine cp -a` recipe, then delete the stray store.
+- **`services.backend.group_add array items[0,1] must be unique`** or the frontend crash-looping on `host not found in upstream`: you stacked dev + prod/hosted compose files (#2557). Run the prod or hosted file **alone**.
+- **Agents still on the old base image after `docker compose pull`**: the base image is not a compose service — re-run `start.sh --hosted` (pulls + retags `trinity-agent-base:latest`), then cold stop/start the agents.
+- **`TUNNEL_TOKEN` set but no `cloudflared` container**: the profile is not active — `COMPOSE_PROFILES=tunnel` in `.env` or `--profile tunnel`; hosted: re-run `start.sh --hosted`.
+- **MCP unreachable on an 80/443-only host**: `https://<host>/mcp` needs the frontend image with the #2475 nginx proxy — rebuild/pull the frontend.
+- **Provisioned droplet serves HTTP or a certificate error**: `cat /etc/trinity/tls-status`, `journalctl -u caddy -n 100`, `caddy version` ≥ 2.11.3, port 80 open for ACME; the IP certificate is `shortlived` (~6 days) and renews only while the machine runs. A custom domain needs the saved Public URL host to equal the domain exactly (`curl 'http://127.0.0.1:8000/api/public/tls-allowed?domain=<name>'` → 200).
+- **Agents lost outbound internet on a provisioned host**: `iptables -L TRINITY-FW -n` — the RELATED,ESTABLISHED RETURN must be first; `systemctl status trinity-docker-firewall`, re-run `scripts/deploy/docker-firewall.sh`.
+
+### Agent 503s on its first turn / hooks not running / Codex 401s — stale base image
+
+All three are image-side fixes in v0.9.5 that need `build-base-image.sh` **plus** a cold recreate:
+
+- **`Exec format error` on arm64** (#2537): `docker exec agent-x claude --version` fails — the old image silently shipped a 500-byte stub; the new build fails instead of shipping one.
+- **`GUARDRAILS: ERROR — … MISSING / WRITABLE`** in `docker logs agent-x` (#2299): stale image or a tampered `/etc/claude-code`; no guardrail hooks run until rebuilt.
+- **Codex API-key agent 401s every turn** (#2208/#2333): `codex exec` reads `$CODEX_HOME/auth.json`, not env; grep `[Codex] could not write API-key auth.json`.
+- **An agent pegging a CPU in `credential_sanitizer`** (#2398): quadratic key test on the old image, 40s per key.
+
+### Agent shows "Up" but no request completes (wedged agent server)
+
+Issue #2455/#2503 (v0.9.5, image-side). `faulthandler` is armed at agent-server start; an auto-dump `[Diagnostics] THREAD DUMP — <reason>` fires from the stuck-reader branches, and a loop watchdog logs `[Diagnostics] EVENT LOOP STALLED — no beat for Ns` (re-dumps every 5 min, then `event loop RECOVERED`). Trigger one by hand with `docker exec agent-x kill -USR1 1` — every thread's stack goes to the container log, frames only, no restart. Read the dump, restart the agent, file the dump.
+
+### Executions FAILED with 503 / "queued" rows / watchdog text changed
+
+Issue #904 / #2433 / #2435 (v0.9.5). Outbound agent calls are capped per uvicorn worker by `BACKEND_AGENT_CALL_LIMIT` (8; prod runs 2 workers → 16 fleet-wide). A call over the cap **parks**; since #2435 a parked call is registered in-flight (`execution:inflight:{id}`, 60s TTL) so the watchdog no longer false-fails it, its `started_at` is re-stamped at dispatch (admission kept in `queued_at`) so the park does not spend the run's budget, and it is cancellable (→ `CANCELLED`, never `FAILED`). Waiting past `BACKEND_AGENT_CALL_QUEUE_TIMEOUT_S` (3600; `0` = forever) gives an honest **503 / FAILED** row. Raise the cap on a large fleet with many concurrent schedules; `>5s` queue waits log a warning (`[InflightDispatch]`), and `CleanupReport.dispatch_inflight_skipped` counts withheld rows. The orphan error text is now `Execution not tracked by agent '<name>' (not running, not pending, not recently completed) …` — update any grep for the old `Execution completed on agent but status not reported`. Also: a FAILED row is labelled `TIMEOUT` only when elapsed ≥ limit − 30s (#2752; earlier transport timeouts get `NETWORK` with the real cause); watchdog-swept rows record `duration_ms = NULL` instead of a fabricated value (#2434 — a >24.8-day value used to overflow PG `int4` and roll back the **whole** sweep batch, freezing every stale row fleet-wide while logging success; the upgrade boot self-heals it); `QUEUED` as a non-terminal status appears only for agents in `PULL_MODE_PILOT_AGENTS` (#2513).
+
+### Skills source sync red / operator-queue flood from `_skills-sync`
+
+- **`refusing tag 'v0.2.0' … pinned tag must not move`** in `GET /api/skills/sources` `last_error`: on a build before #2551 this is an annotated-tag false positive — update. On a current build the tag really moved: `PUT /api/skills/sources/{id}` with a new `ref`, then `POST …/sync`. The bundled catalog pin is `trinity-skills v0.2.0` for **fresh installs only** (`TRINITY_DEFAULT_SKILL_SOURCE_REF`); existing instances keep their row.
+- **"Legacy skills-library adoption refused" items piling up**: before #2777 the refusal filed one row per *sync*; now one per refused URL. A steady-state `low` item means a lingering `skills_library_url` row — add that repo as a source, then delete `skills_library_url` / `skills_library_branch` from `system_settings`. Matching is by normalised repo since #2764.
+- **Assigned skill missing from the `/` popup**: the assign response now carries `delivery.status` (`injected|partial|pending_start|in_progress|not_delivered`, #2704) — `pending_start` = agent stopped; `not_delivered` / `docker_unavailable` → check `DOCKER_GID`.
+
+### Operator answered an ask, nothing happened / subscription tile says LIMIT but agents work
+
+- `GET /api/agents/{name}/operator-resume` — the answer-wakes-parked-agent hook is off by default (#2312); `PUT {"enabled": true}` (costs a run per answer). An approval `respond` rejected with **422** and a list: send one of `offered_options` verbatim (#2376).
+- Subscription "limit" with working agents: read `auth_failures_24h` / `token_status` on `GET /api/agents/subscription-pressure` — since #2354 an auth failure is not a rate limit; fix the token and `POST /api/subscriptions/{id}/usage/refresh`. Agents restarting after you registered a subscription on an instance without `ANTHROPIC_API_KEY` is the expected #2741 adoption wave.
+- A room that died at N/N and cannot be reopened: `GET /api/enterprise/room-budget-defaults`, raise via PUT (human admin token) — the existing room stays closed. `set_canvas` 409 "already has 100 canvases": `clear_canvas` / bulk-delete, or raise `CANVAS_MAX_PER_AGENT` and `compose up -d`.
 
 ### Backend not responding
 
@@ -917,6 +1198,8 @@ Default execution timeout was bumped 15min → 60min (#665). The deadline is now
 ### Fan-out turn recorded SUCCESS but the subagents' work is missing
 
 Issue #2127 / #1870 (v0.9.0) — `claude --print` emits one `result` line per turn *segment* and deliberately stays alive between segments to await background subagents. The old early-completion treated the first `result` as the end of the turn and SIGTERMed the process group 2s later with exit 0 — so a fan-out was killed mid-wait, recorded **success**, billed, and stored "I'll wait for the notification" as the response (or surfaced as `error_during_execution` when the timing differed, #1870). Early-finalize now requires all three: a result seen **and** no waited background tasks in the ledger **and** stdout silent for `AGENT_IDLE_FINALIZE_S` (default 300s; ≤0 refused). Consequences: fan-outs now run to completion, so they spend more and can newly hit `--max-turns`; agents with an execution timeout under ~300s lose the early finalize (an honest 504 instead of a rescued success). **Requires a base-image rebuild plus a cold agent recreate** — a fleet on the old image still has the bug. Tune `AGENT_IDLE_FINALIZE_S` from the longest silence a healthy run produces (one long assistant message is a single stdout line, measured ~40s of dead air for ~10k chars); bias generous — too low silently truncates a finished deliverable and calls it success.
+
+**v0.9.5 follow-ons:** a turn that killed background work at CLI exit stays `success` but stores `schedule_executions.turn_integrity` (`background_tasks_killed`, `_pending_at_exit`) and prefixes the response with `> ⚠️ Background work lost: N background task(s) …` (#2467/#2473) — NULL means no evidence, not healthy. The headless deny list grew from 1 to 11 tools (`ScheduleWakeup`, `Monitor`, `SendMessage`, `ListAgents`, … — tools whose result promises a later event a one-shot `claude --print` can never deliver, #2468/#2476); the log line is now `[Headless Task] Disallowed tools:`. Image-side; needs the rebuild + recreate.
 
 ### PostgreSQL backend won't connect
 
@@ -1050,7 +1333,7 @@ Fix: update to v0.9.0 — the new `trinity-archives-init` one-shot chowns the vo
 
 ### Operator-queue items from `_db-backup` / `_log-archive`
 
-Those are not agents. Platform maintenance jobs file their alarms directly (bypassing the #1632 agent-ingestion caps by construction) under uncreatable sentinel names — `_db-backup` (#2216), `_log-archive` (#2205), plus the reserved id prefixes `db-backup-`, `log-archive-`, `alert-budget-` — so an agent can neither pre-create nor silence them. Responding to one authorizes nothing; it is a pointer to the runbook entries above. Related: platform alert emitters that an *agent* can influence (e.g. the unknown-slash-command alert) are now depth-budgeted per (agent, type) by `OPERATOR_ALERT_MAX_PENDING_PER_TYPE` (#1677, default 5) — at the cap you get one cooldown-gated `alert-budget-<agent>-<type>` episode item instead of a flood.
+Those are not agents. Platform maintenance jobs file their alarms directly (bypassing the #1632 agent-ingestion caps by construction) under uncreatable sentinel names — `_db-backup` (#2216), `_log-archive` (#2205), `_sub-headroom` (subscription headroom alarms, ent#434), `_skills-sync` (legacy skills-library adoption refusals, #2777) — plus the reserved id prefixes `db-backup-`, `log-archive-`, `alert-budget-`, `sub-headroom-`, `skills-legacy-adoption-`, `role-drift-` — so an agent can neither pre-create nor silence them. New item types in v0.9.5: `workspace_problem_report` (a client's thumbs-down with a report, ent#498) and `portal-inbox-collision-<dir>`. Responding to one authorizes nothing; it is a pointer to the runbook entries above. Related: platform alert emitters that an *agent* can influence (e.g. the unknown-slash-command alert) are now depth-budgeted per (agent, type) by `OPERATOR_ALERT_MAX_PENDING_PER_TYPE` (#1677, default 5) — at the cap you get one cooldown-gated `alert-budget-<agent>-<type>` episode item instead of a flood.
 
 ---
 
@@ -1083,9 +1366,15 @@ Those are not agents. Platform maintenance jobs file their alarms directly (bypa
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `ADMIN_PASSWORD` | **Yes** | Admin login (12+ chars; no sensible default — operator must set) |
+| `ADMIN_PASSWORD` | **Yes** | Admin login (12+ chars; no sensible default — operator must set). Blank is legal ONLY with `ADMIN_PASSWORD_SOURCE=browser` (marketplace images) |
+| `ADMIN_USERNAME` | Optional (default `admin`) | Admin username. **Forwarded by prod compose since v0.9.5 (#2385)** — before that it was inert there and the backend provisioned `admin` regardless. This agent's `POST /token` must use the same value |
+| `ADMIN_PASSWORD_SOURCE` | Marketplace images only (ent#580) | `browser` = no admin until the first visitor claims `/setup`; written by the 1-Click image's first `start.sh --hosted`, forwarded by the hosted compose only. **Leave unset** on every hand-run install — see [Browser admin claim](#browser-admin-claim-on-marketplace-images-ent580--2715) |
 | `SECRET_KEY` | **Yes** (auto-gen) | JWT signing — generated by `start.sh` if blank |
-| `CREDENTIAL_ENCRYPTION_KEY` | **Yes** (auto-gen) | Encrypt stored tokens; loss = unrecoverable credentials |
+| `CREDENTIAL_ENCRYPTION_KEY` | **Yes** (auto-gen) | Encrypt stored tokens; loss = unrecoverable credentials. Since v0.9.5 also wraps the six platform credential rows in `system_settings` (ent#435) and the backend **refuses to boot** without it when such rows exist |
+| `TRINITY_IMAGE_TAG` | Hosted installs (#2280, default `latest`) | Which published GHCR image set `start.sh --hosted` / `docker-compose.hosted.yml` pulls (platform images + agent base). **Pin it** — `latest` moves on every release, so unpinned the next `start.sh --hosted` is an unscheduled upgrade. Pre-release tags never move `latest`. Ignored by source builds |
+| `TRINITY_INSTALL_SOURCE` | Set by provisioning only (#2380, default empty) | Install provenance: `do-marketplace` \| `vultr-marketplace` \| `do-script` \| `script`. Read **once at first boot** into `system_settings` (write-once; the API refuses to change it; an unrecognised value records nothing so a corrected marker still lands next boot). Gates the first-run "Secure this instance" hardening card on marketplace/`do-script` installs only — never on TLS state. Bare passthrough in all compose files. Surfaced on `/api/version` and `/api/settings/feature-flags` |
+| `FRONTEND_PORT` | Optional (default 80) | Host port for the frontend. **Honoured by prod/hosted since v0.9.5** (#2390; was hard-coded `80:8080`). `--provision` sets 8081 so Caddy owns 80/443 |
+| `COMPOSE_PROFILES` | Optional | Compose reads it from `.env`; `start.sh --hosted` writes `tunnel` here when `TUNNEL_TOKEN` is set. `cloudflared` starts under no other condition |
 | `INTERNAL_API_SECRET` | **Yes** (auto-gen) | Scheduler→backend auth. **Set it explicitly in prod — do not rely on the `SECRET_KEY` fallback.** #848 widened its blast radius: with `MCP_INLINE_AUTH_ENABLED` on, a holder can assert any verified email over `/api/internal/mcp-auth/*`. That grants nothing beyond what internal-secret compromise already grants (god-mode over `/api/internal/*`), but it should be rotated and scoped on its own terms rather than inheriting `SECRET_KEY`'s lifecycle |
 | `REDIS_PASSWORD` | **Yes** (auto-gen) | Redis admin (`default` ACL user) — #589 |
 | `REDIS_BACKEND_PASSWORD` | **Yes** (auto-gen) | Redis runtime user — embedded in `REDIS_URL` at compose render |
@@ -1098,11 +1387,11 @@ Those are not agents. Platform maintenance jobs file their alarms directly (bypa
 | `GOOGLE_API_KEY` | For Gemini-powered agents | Fallback for `GEMINI_API_KEY`; injected into agent containers |
 | `GITHUB_PAT` | For GitHub templates | Access private agent template repos |
 | `PUBLIC_CHAT_URL` | For public links | External URL for public chat |
-| `TUNNEL_TOKEN` | For Cloudflare Tunnel | Enable `cloudflared` profile |
+| `TUNNEL_TOKEN` | For Cloudflare Tunnel | Cloudflare tunnel token. The `cloudflared` service is `--profile tunnel` gated in every stack: only `start.sh --hosted` activates the profile automatically; prod/dev need `--profile tunnel` or `COMPOSE_PROFILES=tunnel` |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` | For SMTP email | When `EMAIL_PROVIDER=smtp` (#771) |
 | `SENDGRID_API_KEY` | For SendGrid email | When `EMAIL_PROVIDER=sendgrid` (#771) |
 | `SLACK_SOCKET_CONNECTION_COUNT` | Optional | Concurrent Slack Socket Mode connections (default 2, range 1–10) |
-| `LOG_RETENTION_DAYS` | Optional | Days to keep Vector logs (default **5** since v0.8.5 — community retention floor #1065; was 90). The floor is applied by *seeding* fresh installs, not clamping (#1645) — existing configured values are preserved, and any admin may widen windows. Check effective windows: `GET /api/settings/retention` |
+| `LOG_RETENTION_DAYS` | Optional | Days to keep Vector logs (default **5** since v0.8.5 — community retention floor #1065; was 90). The floor is applied by *seeding* fresh installs, not clamping (#1645) — existing configured values are preserved, and any admin may widen windows. Check effective windows: `GET /api/settings/retention`. Since v0.9.5 (#2432) **every** boot seeds a `system_settings` row for each retention key that lacks one, at the value in force — so upgraded installs stop inheriting future code-default changes and the two new windows `subscription_headroom_retention_days` / `subscription_failure_event_retention_days` (30 / 30; the latter replaces a hard-coded 24h sweep of `subscription_rate_limit_events`) appear alongside the rest |
 | `LOG_ARCHIVE_ENABLED` | Optional | Compress to `/data/archives` instead of delete (default true) |
 | `LOG_CLEANUP_HOUR` | Optional | UTC hour for daily cleanup job (default 3) |
 | `DB_BACKUP_ENABLED` / `DB_BACKUP_HOUR` / `DB_BACKUP_MINUTE` / `DB_BACKUP_PG_DUMP_TIMEOUT_SECONDS` | Optional (#2216, defaults `true` / `3` / `30` / `1800`) | Automatic nightly database backup, **both backends**, default ON — artifacts under `/data/backups` (same-disk scope). `false` disables both the nightly job and the boot-time pre-migration copy. Time is UTC (03:30 sits before the 04:15/04:30 destructive maintenance jobs); malformed/out-of-range values fall back with a WARNING. Forwarded by both compose files (an unforwarded var is inert, #1486 class). Retention is deliberately NOT an env var — it is the ops setting `backup_retention_days` (default 14, min-keep 3), see [Backup Database](#backup-database) |
@@ -1119,6 +1408,11 @@ Those are not agents. Platform maintenance jobs file their alarms directly (bypa
 | `PUBLIC_ACCESS_REQUESTS_ENABLED` | Optional (default false) | Default-deny public self-signup on `POST /api/access/request`; whitelist stays authoritative unless `true` |
 | `DISPATCH_ASYNC` | Optional (#1083) | Fire-and-forget dispatch for autonomous turns (default false; safe to flip — non-202 falls back to sync) |
 | `DISPATCH_TIMEOUT` / `PRE_CHECK_TIMEOUT` | Optional (#1022) | Scheduler→backend dispatch (30s) / pre-check (70s) deadlines |
+| `BACKEND_AGENT_CALL_LIMIT` / `BACKEND_AGENT_CALL_QUEUE_TIMEOUT_S` | Optional (#904/#2433, defaults 8 / 3600) | Outbound agent HTTP calls one uvicorn worker holds at once (prod runs 2 workers → fleet bound 2×) and how long a call may park in the queue before an honest 503 / FAILED row (`0` = forever — a deadlocked agent-to-agent chain then never surfaces). **Forwarded by prod since v0.9.5** (#2433 found operators unable to raise it). Parked calls are watchdog-visible and re-anchored at dispatch since #2435. Raise on a large fleet with many concurrent schedules; per-agent `max_parallel_tasks` still caps each agent. Backend restart to apply |
+| `SUBSCRIPTION_SWEEP_CONCURRENCY` | Optional (ent#434, default 4) | Concurrent probes in the background subscription-headroom sweep (bounded so N subscriptions × a 15s probe timeout stay inside the leader lease). Cadence is a code constant |
+| `MCP_CHAT_TIMEOUT_MS` / `MCP_RECOVERY_TIMEOUT_MS` | Optional (#914/#2661, defaults 25000 / 5000) | mcp-server ceilings for the synchronous backend fetch in `chat_with_agent` sync mode (sequential and parallel) and for the executions lookup that runs after an abort. On abort the tool returns a structured `queued_timeout` receipt with the `execution_id` to poll instead of a bare `fetch failed`. Keep the first **below** the MCP gateway's own 30–60s ceiling (the receipt window is `MCP_CHAT_TIMEOUT_MS + 10s`); the second must fail fast. mcp-server restart to apply |
+| `CANVAS_MAX_PER_AGENT` | Optional (ent#438/#553, default 100) | Canvases an agent may hold before `set_canvas` is refused with a 409 that names this number (INSERT-time, never evicts). Read at backend import → `compose up -d` to apply; forwarded by all three compose files |
+| `WORKSPACE_VOICE_MAX_DURATION` | Optional (ent#534, default 1800) | Seconds one Workspace voice call may run (ends with a spoken + written notice). Separate from the Agent Detail overlay's `VOICE_MAX_DURATION` (300) by design |
 | `BACKEND_URL` | For OAuth | Backend's public origin used to build OAuth redirect URIs (default `http://localhost:8000`) |
 | `EXTRA_CORS_ORIGINS` | Optional | Comma-separated extra allowed CORS origins |
 | `TELEMETRY_CONTAINER_STATS_TTL` / `TELEMETRY_DOCKER_POOL_SIZE` | Optional (#1096) | `/api/telemetry/containers` cache freshness in s (10) / max concurrent Docker stat fetches (16) |
@@ -1136,7 +1430,7 @@ Those are not agents. Platform maintenance jobs file their alarms directly (bypa
 | `VITE_BUG_REPORTING_ENABLED` / `VITE_BUG_INTAKE_URL` | Optional (#1116/#1489) | Frontend **build-time** (baked into the world-readable client bundle — rebuild the frontend image to apply; never put a secret in a `VITE_*` var). In-app bug/feedback widget on/off (default true) and its intake endpoint (default `intake.abilityai.dev`). Repointing the URL also needs a CSP `connect-src` change (nginx + vite config) |
 | `DISPATCH_BREAKER_ENABLED` | Optional (#526/#1487, default false) | GLOBAL gate for the per-agent dispatch circuit breaker that fast-fails NEW executions (503) when an agent is auth-dead instead of poisoning the backlog. Two-tier: this flag AND the per-agent toggle (`PUT /api/agents/{name}/circuit-breaker`) must BOTH be on — with this off, the per-agent toggle no-ops |
 | `REMINDER_MESSAGE_MAX_CHARS` / `REMINDER_MIN_DELAY_SECONDS` / `REMINDER_MAX_DELAY_SECONDS` / `MAX_PENDING_REMINDERS_PER_AGENT` / `MAX_REMINDERS_PER_AGENT_PER_DAY` / `REMINDER_RATE_LIMIT` | Optional (#1296) | Agent self-reminder caps: message 4000 chars, fire window 60s–30d, 25 pending + 100/day per agent, 30 `set_reminder` calls/agent/60s. All have working code defaults |
-| `OPERATOR_QUEUE_*` (14 caps: `_MAX_PENDING_PER_AGENT`, `_CREATE_RATE_LIMIT`/`_WINDOW`, `_FLEET_CREATE_RATE_LIMIT`, `_MAX_SCAN_PER_CYCLE`, `_MAX_FILE_BYTES`, `_TITLE_MAX`, `_QUESTION_MAX`, `_CONTEXT_MAX_BYTES`, `_OPTIONS_MAX_BYTES`, `_ID_MAX`, `_EXECUTION_ID_MAX`, `_FLOOD_ALERT_COOLDOWN_SECONDS`) | Optional (#1632) | Ingestion caps bounding a compromised/runaway agent flooding `~/.trinity/operator-queue.json` — depth (25 pending/agent), rate (60/agent + 300/fleet per 60s), file-size (2 MB skip), field-size truncation, one flood alert per agent per 5 min. Generous by design: cap abuse, not use |
+| `OPERATOR_QUEUE_*` (15 caps: `_MAX_PENDING_PER_AGENT`, `_CREATE_RATE_LIMIT`/`_WINDOW`, `_FLEET_CREATE_RATE_LIMIT`, `_MAX_SCAN_PER_CYCLE`, `_MAX_FILE_BYTES`, `_TITLE_MAX`, `_QUESTION_MAX`, `_CONTEXT_MAX_BYTES`, `_OPTIONS_MAX_BYTES`, `_ID_MAX`, `_EXECUTION_ID_MAX`, `_EMAIL_MAX` (320, ent#364 addressee email clamp), `_FLOOD_ALERT_COOLDOWN_SECONDS`) | Optional (#1632) | Ingestion caps bounding a compromised/runaway agent flooding `~/.trinity/operator-queue.json` — depth (25 pending/agent), rate (60/agent + 300/fleet per 60s), file-size (2 MB skip), field-size truncation, one flood alert per agent per 5 min. Generous by design: cap abuse, not use |
 | `OPERATOR_ALERT_MAX_PENDING_PER_TYPE` | Optional (#1677, default 5) | Per-(agent, alert-type) pending-depth budget for **platform** operator-queue emitters an agent can influence (the #1632 caps only bound the agent-authored *file* seam; direct-DB platform creates were exempt — e.g. an unknown slash-command alert minted one `priority:high` row per distinct command at dispatch throughput). At the cap: one cooldown-gated `alert-budget-<agent>-<type>` episode item; every failure arm fail-closed (suppresses the alert only — the FAILED execution row remains the primary surface) |
 | `PULL_MODE_PILOT_AGENTS` / `MAX_REDELIVERY` | Optional (#1081, default empty / 3) | Pull/work-stealing pilot (dark by default): comma-separated agent names opted into the agent-side pull worker pool. Backend-only process-env — needs a backend restart AND the agent recreated to engage. `MAX_REDELIVERY` = re-deliveries of an expired pull lease before the row is poison-parked to the operator queue |
 | `TRINITY_DEFAULT_SYSTEM_MANIFEST` | Optional (#1764, default empty) | First-run starter-fleet seed: on a genuinely fresh install, Trinity auto-deploys the bundled `config/manifests/default-system.yaml` once after setup. Set to a path (bind-mounted into the backend) for a custom manifest, or `disabled` to skip seeding |
@@ -1150,9 +1444,11 @@ Those are not agents. Platform maintenance jobs file their alarms directly (bypa
 | `MCP_INLINE_AUTH_TIMEOUT_MS` | Optional (#848, default 15000) | mcp-server-only ceiling for the backend relay fetches on the inline-auth path, so a hung backend returns a structured error instead of an open socket |
 | `ASK_TRINITY_ENDPOINT` | Optional (#1981, default empty) | Endpoint backing the `ask_trinity` MCP docs-Q&A tool. Empty = the public Cloud Function. Point at an internal mirror, or at an unreachable URL to effectively disable it — it degrades to a structured error rather than crashing the call |
 | `TEMPLATE_REGISTRY_ENABLED` / `TEMPLATE_REGISTRY_URL` | Optional (#2033, **default true** / vendor URL) | The GitHub half of the agent-template catalog is fetched at runtime from a vendor-published `registry.yaml`. It only **adds** entries; every failure mode degrades to the bundled list. `false` is the HARD kill switch — no admin toggle or `system_settings` row can re-enable it, and it is the air-gap answer. **Not** coupled to `DO_NOT_TRACK` (a registry fetch is a package-index read, like npm), but it *is* outbound egress on a default install. URL is HTTPS-only, SSRF-validated, redirects refused |
-| `TRINITY_DEFAULT_SKILL_SOURCE` / `_REF` | Optional (#1901, default community repo @ a pinned tag) | Bundled community skills source, seeded on **fresh installs only**. Pinned to a tag, never a branch head — the catalog takes public PRs and skills carry executables. Set the URL to `""` to disable the seed. Compose passes these **bare** (not `${VAR:-}`) precisely so an explicit empty value still means "disabled" |
+| `TRINITY_DEFAULT_SKILL_SOURCE` / `_REF` | Optional (#1901, default community repo @ `v0.2.0` since #2551) | Bundled community skills source, seeded on **fresh installs only** (a bump reaches new installs and nothing else). Pinned to a tag, never a branch head — the catalog takes public PRs and skills carry executables. Set the URL to `""` to disable the seed. Compose passes these **bare** (not `${VAR:-}`) precisely so an explicit empty value still means "disabled" |
 | `SKILLS_RECONCILE_MAX_REMOVALS` / `SKILLS_FLEET_INJECT_CONCURRENCY` | Optional (#1883, default 10 / 5) | Skills-library lifecycle automation: blast-radius cap (a start-path reconcile refuses above this many removals per agent) and parallelism of a fleet re-inject sweep. The auto-sync / auto-re-inject **toggles** live in Settings (`system_settings`), not here; the loop runs on one Redis-leader worker |
 | `PORTAL_CHAT_BURST_LIMIT` / `PORTAL_CHAT_HOURLY_LIMIT` / `PORTAL_UPLOAD_BURST_LIMIT` / `PORTAL_UPLOAD_HOURLY_LIMIT` / `PORTAL_TITLE_MODEL` / `PORTAL_TITLE_TIMEOUT_SECONDS` | Optional (#2084, defaults 20 / 300 / 20 / 100 / `claude-haiku-4-5-20251001` / 15) | Workspace (client portal) rate limits and thread-title model. The limits are **enforced at these defaults whether or not the vars are set** — these only tune them |
+| `PORTAL_FILE_BURST_LIMIT` / `PORTAL_FILE_HOURLY_LIMIT` / `PORTAL_FILE_DELETE_BURST_LIMIT` | Optional (#2582, v0.9.5, defaults 20 / 100 / 60) | Workspace file **downloads** per client email per 60s / 3600s, and deletes per 60s. Deliberately tighter than uploads: reading a file back out of an agent inbox is the only path exposing `extract_from_agent` (a synchronous docker-py tar read on the shared 4-worker executor, ~3× file size in RAM) to a rostered client, and the hourly tier is the one that binds. (`PORTAL_RATING_BURST_LIMIT` / `_HOURLY_LIMIT` exist in code — 60 / 300 — but are forwarded by no compose file, so they are inert in `.env`) |
+| `TRINITY_PREINSTALL_PLUGINS` / `TRINITY_PLATFORM_PLUGINS` | Optional (ent#411/#2284, defaults 1 / 1) | Base-image build arg that bakes the `abilityai/abilities` marketplace + `trinity@abilityai` plugin into the image (never fatal; `[base-image] withheld trinity@abilityai: …` names the failed step), and the agent-side runtime opt-out. Older workspace volumes receive the plugin from the boot reconciler (`plugins_reinstall`, now runs even for agents declaring no plugins); state in `~/.trinity/plugins-state.json`, compatibility INFO check I-006 |
 | `TRINITY_INSTANCE_NAME` | Optional (#1997, default empty) | Label naming THIS instance in outbound canary alerts, so instances sharing one Slack webhook stay tellable apart (`[eu2] 🚨 S-01 …`). Unset is the norm: the resolver falls back to the first DNS label of `FRONTEND_URL`, then the first 8 chars of the installation id. Truncated to 32 hostname-shaped chars |
 
 ---
@@ -1164,7 +1460,7 @@ Those are not agents. Platform maintenance jobs file their alarms directly (bypa
 | `scripts/run.sh "cmd"` | Run command locally or via SSH |
 | `scripts/status.sh` | Quick health check |
 | `scripts/restart.sh` | Restart all Trinity services |
-| `scripts/update.sh` | Pull latest, rebuild, restart |
+| `scripts/update.sh` | Pull latest, rebuild, restart. Detects a **hosted** install (`COMPOSE_FILE=docker-compose.hosted.yml`) and delegates to `start.sh --hosted` instead of building; pre-checks `CREDENTIAL_ENCRYPTION_KEY` (ent#435 boot refusal); runs the one-shot agent restart-policy sweep (#2541) after the platform is up |
 | `scripts/backup.sh` | Manual on-demand DB backup to `~/backups/` on the host — SQLite via `sqlite3 .backup` (never a raw `cp`), bundled-PG via `pg_dump -Fc`. The platform also backs itself up nightly (#2216) |
 | `scripts/tunnel.sh` | SSH tunnels for local browser access |
 

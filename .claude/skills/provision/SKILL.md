@@ -28,11 +28,13 @@ If not provided, present the options:
 | Provider | Size | Cost | Guide |
 |----------|------|------|-------|
 | Hetzner | CX23 (2 vCPU, 4GB) | €3.49/mo | provision/hetzner.md |
-| DigitalOcean | s-2vcpu-4gb | $24/mo | provision/digitalocean.md |
+| DigitalOcean | s-2vcpu-4gb (manual) · s-4vcpu-8gb (one-command, hosted images) | $24 · $48/mo | provision/digitalocean.md |
 | AWS | t3.medium (2 vCPU, 4GB) | ~$30/mo | provision/aws.md |
 | GCP | e2-medium (2 vCPU, 4GB) | ~$40/mo | provision/gcp.md |
 | Localhost | Any OS with Docker | Free | provision/localhost.md |
 ```
+
+**DigitalOcean has an upstream one-command path since v0.9.5** (#2380/#2707): `trinity-do-create.sh` run on the operator's machine creates the droplet, provisions Docker + Caddy (HTTPS on the bare IP) + firewalls, and installs from prebuilt images with the admin pre-provisioned. Offer it first for DO; it needs `doctl` signed in and 8 GB RAM (hosted mode enforces it). See `provision/digitalocean.md` → "One-command install".
 
 ### 2. Read the Guide
 
@@ -67,12 +69,15 @@ python3 -c "import secrets; print(secrets.token_hex(32))"
 python3 -c "import secrets; print('trinity_' + secrets.token_hex(16))"
 ```
 
-Start Trinity:
+Start Trinity — through `start.sh`, not a bare `compose up` (it generates the remaining secrets, probes `DOCKER_GID`, chowns the data dir, and refuses a dev/prod data-store mix-up, #2390):
 ```bash
-docker compose -f docker-compose.prod.yml up -d
+./scripts/deploy/build-base-image.sh      # source build only; hosted mode pulls it
+./scripts/deploy/start.sh                 # prod stack; or `start.sh --hosted` for prebuilt GHCR images (pin TRINITY_IMAGE_TAG in .env)
 sleep 10
 curl http://localhost:8000/health
 ```
+
+Never stack compose files (`-f docker-compose.yml -f docker-compose.prod.yml` breaks on duplicate `group_add` / doubled frontend ports, #2557); each of dev / prod / hosted is a standalone file set.
 
 ### 4. Configure This Agent
 
@@ -82,9 +87,10 @@ After Trinity is running, update this agent's `.env`:
 SSH_HOST=<SERVER_IP>
 SSH_USER=<user>
 SSH_KEY=~/.ssh/id_rsa          # or SSH_PASSWORD=...
-TRINITY_PATH=/home/<user>/trinity
+TRINITY_PATH=/home/<user>/trinity    # /opt/trinity on a one-command DO droplet
+COMPOSE_FILE=docker-compose.prod.yml # docker-compose.hosted.yml for a hosted (prebuilt-image) install
 BACKEND_PORT=8000
-FRONTEND_PORT=80
+FRONTEND_PORT=80                     # 8081 on a --provision'd host (Caddy owns 80/443)
 MCP_PORT=8180
 SCHEDULER_PORT=8001
 ADMIN_PASSWORD=<your-admin-password>

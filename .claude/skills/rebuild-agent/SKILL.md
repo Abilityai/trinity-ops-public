@@ -16,6 +16,8 @@ Rebuilds agent containers using Trinity's internal `recreate_container_with_upda
 
 **What survives a recreate:** the workspace volume, env, mounts, labels, limits — and since #1704 the agent's Claude Code **plugin selection**, which is persisted as a committed, secret-free `~/.trinity/plugins.yaml` manifest and re-installed by `startup.sh` if the plugin cache is missing (a git-based reconstitution onto a fresh volume drops the gitignored `~/.claude/plugins/`). A recreate onto the same volume runs zero installs. Also picked up on recreate, not restart: `AGENT_LOG_MAX_*`, `AGENT_TMP_SIZE`, `AGENT_IDLE_FINALIZE_S`, `AGENT_TOOL_STALL_LIMIT_S`.
 
+**Restart policy (v0.9.5, #2541):** the recreate tail bakes `restart: unless-stopped` **unconditionally** — it normalises rather than carrying the old container's policy forward. A recreated-and-left-stopped agent (`preserve_run_state`) carries Docker's manual-stop flag, so it still stays stopped across reboots. If the only goal is the policy (no image or config change), `/update` step 8c's `docker update --restart unless-stopped` sweep is cheaper than a recreate. After the wave, `docker logs agent-x | grep GUARDRAILS:` should say `registration verified` on the new image (ent#345).
+
 ## Arguments
 
 - `<name>` — rebuild one agent (omit the `agent-` prefix)

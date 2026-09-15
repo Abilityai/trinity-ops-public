@@ -26,7 +26,22 @@ TRINITY=${TRINITY_PATH:-~/trinity}
 COMPOSE=${COMPOSE_FILE:-docker-compose.prod.yml}
 BRANCH=${TRINITY_BRANCH:-main}
 echo "Target branch: $BRANCH"
+case "$COMPOSE" in *hosted*) echo "MODE: hosted (prebuilt GHCR images, #2280)";; *) echo "MODE: source build";; esac
 ```
+
+**Hosted installs** (`COMPOSE_FILE=docker-compose.hosted.yml`, v0.9.5) do not build: the upgrade is `start.sh --hosted`, which pulls the four platform images **and** the agent base image (retagged `trinity-agent-base:latest`) and brings the stack up. Never `docker compose pull` alone — it leaves every agent on the old runtime. The release is selected by `TRINITY_IMAGE_TAG` in the server `.env`; check it is pinned before proceeding (`latest` moves on every release, so an unpinned tag makes this an unscheduled major upgrade):
+
+```bash
+./scripts/run.sh "grep -E '^TRINITY_IMAGE_TAG=' ${TRINITY_PATH:-~/trinity}/.env || echo 'TRINITY_IMAGE_TAG UNSET (= latest)'"
+```
+
+### 2b. Pre-check `CREDENTIAL_ENCRYPTION_KEY` (v0.9.5, ent#435)
+
+```bash
+./scripts/run.sh "grep -cE '^CREDENTIAL_ENCRYPTION_KEY=.+' ${TRINITY_PATH:-~/trinity}/.env"
+```
+
+`0` ⇒ **stop**. The 0.9.5 secret-settings migration (#2330) encrypts six credential rows in `system_settings` at first boot and the backend refuses to start without the key when such rows exist. Set it (`openssl rand -hex 32`) and only then continue. Note for the summary: after this upgrade the operator must **rotate every credential that was entered via Settings** — old backups still hold plaintext.
 
 ### 3. Check Running Executions
 
@@ -94,7 +109,9 @@ echo "New version: $AFTER"
 
 Log full git output, files changed, new commit hash.
 
-### 8. Rebuild Containers
+### 8. Rebuild Containers (source build) — or pull (hosted)
+
+**Source build:**
 
 ```bash
 source .env
@@ -103,7 +120,15 @@ COMPOSE=${COMPOSE_FILE:-docker-compose.prod.yml}
 ./scripts/run.sh "cd $TRINITY && sudo docker compose -f $COMPOSE build --no-cache backend frontend mcp-server scheduler"
 ```
 
-This step is load-bearing (#1814): `start.sh` never rebuilds platform images, so a bare `git pull` leaves the previous build running the new code. Step 11 verifies it took (`version` == `image_version`).
+This step is load-bearing (#1814): `start.sh` never rebuilds platform images, so a bare `git pull` leaves the previous build running the new code. Step 11 verifies it took (`version` == `image_version`). Since v0.9.5 the frontend builds on `node:26-alpine` and the backend image needs `src/backend/shared_sessions` (rooms in OSS core, ent#443) — a custom Dockerfile without that `COPY` dies at import.
+
+**Hosted:** skip the build and step 9 — one command pulls and starts everything:
+
+```bash
+./scripts/run.sh "cd ${TRINITY_PATH:-~/trinity} && sudo ./scripts/deploy/start.sh --hosted --unattended"
+```
+
+`manifest unknown` = `TRINITY_IMAGE_TAG` names an unpublished tag; `denied` = the GHCR package is private (report upstream, do not `docker login` around it). `start.sh` also refuses to bring a dev-stack database up under hosted (or vice versa) — bring the stack up with the file set it was installed with, or copy the data across with the recipe it prints (#2390).
 
 ### 8b. Agent Base Image — did the pulled range touch it?
 
@@ -122,7 +147,24 @@ If anything is listed, the fleet is on a stale agent runtime until the base imag
 
 Adoption rules (v0.9.0, #1809 / #1860 / #1816): a **cold stop → start** of an agent detects the rebuilt image and recreates the container (`recreate_reason: "image_drift"`); Operating Room → **Restart All** routes through the same lifecycle; `trinity-system` adopts on its next stop/start. A start of an already-*running* agent never image-recreates it. For a controlled wave that preserves run state (stopped agents stay stopped), use `/rebuild-agent` — do **not** run `docker restart agent-*` (a plain restart adopts nothing). Report which path you took and whether the user wants the wave now; the base-image rebuild itself is safe to run immediately.
 
-### 9. Restart Services
+**Crossing 0.9.0 → 0.9.5 the rebuild + wave is not optional** — arm64 native binary (#2537), guardrail hooks in `/etc/claude-code/managed-settings.json` (ent#345), pre-installed Trinity plugin (ent#411), Codex `auth.json` (#2333), wedge diagnostics (#2503), the 11-tool deny list (#2476), the sanitizer ReDoS fix (#2398) and parked-call tracking (#2435) all ship in the image. Hosted installs got the new base image from `start.sh --hosted` in step 8; the wave is still needed. After the wave:
+
+```bash
+# every agent should log `GUARDRAILS: registration verified`; ERROR = still on the old image (and NO hooks run)
+./scripts/run.sh "for c in \$(sudo docker ps --format '{{.Names}}' | grep '^agent-'); do echo \"\$c: \$(sudo docker logs \$c 2>&1 | grep -m1 'GUARDRAILS:')\"; done"
+```
+
+### 8c. Agent Restart-Policy Sweep (v0.9.5, #2541 — once)
+
+Agents created on ≥ 0.9.5 are `unless-stopped`; pre-upgrade containers keep `RestartPolicy=no` until recreated and still die on a host reboot. `docker update` on a **stopped** container changes the policy without starting it, so this preserves run state:
+
+```bash
+./scripts/run.sh "for c in \$(sudo docker ps -a --format '{{.Names}}' | grep '^agent-'); do [ \"\$(sudo docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' \$c)\" = no ] && sudo docker update --restart unless-stopped \$c; done"
+```
+
+Runbook on the server: `docs/migrations/AGENT_RESTART_POLICY_2026-09.md`. Tell the user: from now on **never `docker compose down`** on this host (a recreated agent network sends every agent into a dockerd restart loop) — `stop.sh` / `compose stop` instead.
+
+### 9. Restart Services (source build only)
 
 ```bash
 source .env
@@ -157,6 +199,10 @@ SCHED=$(./scripts/run.sh "sudo docker inspect trinity-scheduler --format='{{.Sta
 ./scripts/run.sh "curl -s http://localhost:${BACKEND_PORT:-8000}/api/version | jq '{version, image_version, git_commit_short}'"
 # #2216: the backend takes a pre-migration copy at boot when a migration was pending — confirm it landed
 ./scripts/run.sh "sudo docker logs trinity-backend --tail 500 2>&1 | grep '\[DBBackup\]' | tail -5"
+# ent#435: the secret-settings migration logs what it encrypted (and tells you to rotate); a refusal names MissingEncryptionKeyError
+./scripts/run.sh "sudo docker logs trinity-backend --tail 500 2>&1 | grep -E 'ent#435|MissingEncryptionKeyError' | tail -3"
+# PostgreSQL only: exactly ONE alembic head. Two ⇒ `upgrade head` applied nothing (0043/0044 fork; 0045 merges)
+./scripts/run.sh "sudo docker exec trinity-backend alembic heads 2>/dev/null || echo '(sqlite — n/a)'"
 ```
 
 ### 12. Check INTERNAL_API_SECRET
@@ -189,8 +235,11 @@ Write to `$DEPLOY_FILE`:
 | Backup | {filename} |
 | Backend | {HTTP 200 / failed} |
 | Scheduler | {healthy / unhealthy} |
+| Mode | {source build / hosted @ TRINITY_IMAGE_TAG} |
 | Version / image | {version} / {image_version} — {match / STALE IMAGE} |
 | Base image changed | {no / yes — rebuilt + adoption path, or PENDING} |
+| Restart-policy sweep | {n agents moved to unless-stopped / already done} |
+| Secret-settings migration | {not applicable / ran — ROTATE Settings-entered credentials / REFUSED (key missing)} |
 | INTERNAL_API_SECRET | {OK / CRITICAL} |
 | Tunnel | {restarted / not present} |
 

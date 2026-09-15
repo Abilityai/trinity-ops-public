@@ -208,6 +208,9 @@ TRINITY=${TRINITY_PATH:-~/trinity}
 # Backend on PG and healthy
 ./scripts/run.sh "curl -s http://localhost:${BACKEND_PORT:-8000}/health"
 ./scripts/run.sh "sudo docker exec trinity-backend python3 -c 'import db.engine as e; print(\"is_sqlite:\", e.is_sqlite())'"   # expect False
+# Exactly ONE alembic head (v0.9.5: revisions 0043/0044 forked and 0045 merges them — with two
+# heads `alembic upgrade head` applies nothing and says nothing, so tables "never arrive")
+./scripts/run.sh "sudo docker exec trinity-backend alembic heads"
 # Scheduler on PG (logs the backend explicitly since #300). NB: the scheduler also prints a
 # static `Database: /data/trinity.db` line right before `Scheduler database: PostgreSQL (via
 # DATABASE_URL)` — the SECOND line is authoritative; the first is a cosmetic default, not a fault.

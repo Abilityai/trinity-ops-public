@@ -45,6 +45,8 @@ source .env
 
 Do **not** touch the platform's own artifacts under `/data/backups/` (v0.9.0+, #2216) — the backend prunes those itself by `backup_retention_days` (default 14, newest 3 always kept). If they are eating the disk, widen/narrow that setting via `PUT /api/settings/ops/config`, never `rm`. Likewise `/data/archives` (log archives) is governed by `LOG_RETENTION_DAYS`.
 
+Also out of scope for `docker image prune`: on a **hosted** install the pulled `ghcr.io/abilityai/trinity-*` images and the retagged `trinity-agent-base:latest` are the running release — a dangling older digest is safe to prune, the tagged ones are not. Two v0.9.5 tables have **no** retention sweep by design (`enterprise_rooms*` — closed rooms persist; `agent_canvas_shares` — expired/revoked links persist); they are not disk-relevant, do not hand-delete them.
+
 ### 3. Dry Run Output
 
 ```

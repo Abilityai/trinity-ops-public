@@ -46,6 +46,22 @@ source .env
 ./scripts/run.sh "sudo docker ps -a --format '{{.Names}}\t{{.Status}}' | grep -E 'Restarting|Exited' | grep -E 'trinity|agent'"
 ```
 
+### 5b. Agent Restart Policy, Guardrails, Wedges, Parked Calls (v0.9.5)
+
+```bash
+source .env
+# #2541: `no` = pre-0.9.5 container (dies on reboot — sweep with /update step 8c); a climbing RestartCount is a crash loop
+./scripts/run.sh "for c in \$(sudo docker ps -a --format '{{.Names}}' | grep '^agent-'); do echo \"\$c \$(sudo docker inspect -f '{{.HostConfig.RestartPolicy.Name}} restarts={{.RestartCount}}' \$c)\"; done"
+# ent#345: every agent should say `GUARDRAILS: registration verified`; ERROR = stale base image, NO hooks run
+./scripts/run.sh "for c in \$(sudo docker ps --format '{{.Names}}' | grep '^agent-'); do echo \"\$c: \$(sudo docker logs \$c 2>&1 | grep -m1 'GUARDRAILS:' || echo 'no GUARDRAILS line (pre-0.9.5 image)')\"; done"
+# #2503: auto thread dumps / event-loop stalls in agent servers
+./scripts/run.sh "for c in \$(sudo docker ps --format '{{.Names}}' | grep '^agent-'); do n=\$(sudo docker logs \$c --since 24h 2>&1 | grep -c '\[Diagnostics\] \(THREAD DUMP\|EVENT LOOP STALLED\)'); [ \"\$n\" != 0 ] && echo \"\$c: \$n diagnostics events (24h)\"; done; true"
+# #904/#2433: outbound agent calls parked over BACKEND_AGENT_CALL_LIMIT (raise it on a busy fleet); watchdog recoveries
+./scripts/run.sh "sudo docker logs trinity-backend --since 24h 2>&1 | grep -cE '\[InflightDispatch\]|recovered by watchdog' || true"
+```
+
+Flag: any `no` policy, any `GUARDRAILS: ERROR`, any diagnostics events, or a non-trivial parked/recovered count.
+
 ### 6. Disk Space
 
 ```bash
@@ -123,6 +139,8 @@ source .env
 **Database**: {integrity result}
 
 **Maintenance jobs**: backups {ok/failed/stale/disabled, last success}, archives {writable/NOT}, retention {blocked sweeps}
+
+**Agent runtime (v0.9.5)**: restart policy {n agents still `no`}, guardrails {verified / n ERROR}, wedge diagnostics {n events}, parked calls {n}
 
 ### Recommendations
 {Specific next steps based on findings}
