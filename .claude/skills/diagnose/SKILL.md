@@ -58,9 +58,15 @@ source .env
 ./scripts/run.sh "for c in \$(sudo docker ps --format '{{.Names}}' | grep '^agent-'); do n=\$(sudo docker logs \$c --since 24h 2>&1 | grep -c '\[Diagnostics\] \(THREAD DUMP\|EVENT LOOP STALLED\)'); [ \"\$n\" != 0 ] && echo \"\$c: \$n diagnostics events (24h)\"; done; true"
 # #904/#2433: outbound agent calls parked over BACKEND_AGENT_CALL_LIMIT (raise it on a busy fleet); watchdog recoveries
 ./scripts/run.sh "sudo docker logs trinity-backend --since 24h 2>&1 | grep -cE '\[InflightDispatch\]|recovered by watchdog' || true"
+# ent#615: no agent remote may carry a credential (prints only agent names — never the URL)
+./scripts/run.sh "for c in \$(sudo docker ps --format '{{.Names}}' | grep '^agent-'); do sudo docker exec \$c git -C /home/developer config --get-regexp 'remote\..*\.(url|pushurl)' 2>/dev/null | grep -qE 'https?://[^/]*@' && echo \"\$c: remote still carries a credential\"; done; true"
+# ent#615 sweep reports with refused / gitmodules_hits / root_readable=0 worth acting on
+./scripts/run.sh "sudo docker logs trinity-backend --tail 3000 2>&1 | grep 'ent#615: remote-token sweep' | grep -E \"'refused': [1-9]|'gitmodules_hits': [1-9]|'root_readable': 0\" | tail -5; true"
+# #2742 / #2800: sync-health poller errors (PG `integer out of range` = pre-0063 schema)
+./scripts/run.sh "sudo docker logs trinity-backend --since 24h 2>&1 | grep -iE 'sync.?health.*(error|failed)|integer out of range' | tail -5; true"
 ```
 
-Flag: any `no` policy, any `GUARDRAILS: ERROR`, any diagnostics events, or a non-trivial parked/recovered count.
+Flag: any `no` policy, any `GUARDRAILS: ERROR`, any diagnostics events, a non-trivial parked/recovered count, any agent whose remote still carries a credential, or any sweep report with `refused` > 0, `gitmodules_hits` > 0 (**rotate the platform token**) or `root_readable` 0.
 
 ### 6. Disk Space
 
@@ -140,7 +146,7 @@ source .env
 
 **Maintenance jobs**: backups {ok/failed/stale/disabled, last success}, archives {writable/NOT}, retention {blocked sweeps}
 
-**Agent runtime (v0.9.5)**: restart policy {n agents still `no`}, guardrails {verified / n ERROR}, wedge diagnostics {n events}, parked calls {n}
+**Agent runtime (v0.9.5)**: restart policy {n agents still `no`}, guardrails {verified / n ERROR}, wedge diagnostics {n events}, parked calls {n}, git remotes {clean / n with credential; sweep refused/gitmodules/unreadable}, sync-health {ok / errors}
 
 ### Recommendations
 {Specific next steps based on findings}

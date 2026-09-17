@@ -34,7 +34,13 @@ If not provided, present the options:
 | Localhost | Any OS with Docker | Free | provision/localhost.md |
 ```
 
-**DigitalOcean has an upstream one-command path since v0.9.5** (#2380/#2707): `trinity-do-create.sh` run on the operator's machine creates the droplet, provisions Docker + Caddy (HTTPS on the bare IP) + firewalls, and installs from prebuilt images with the admin pre-provisioned. Offer it first for DO; it needs `doctl` signed in and 8 GB RAM (hosted mode enforces it). See `provision/digitalocean.md` → "One-command install".
+**DigitalOcean has an upstream one-command path since v0.9.5** (#2380/#2707): `trinity-do-create.sh` run on the operator's machine creates the droplet, provisions Docker + Caddy (HTTPS on the bare IP) + firewalls, and installs from prebuilt images with the admin pre-provisioned. Offer it first for DO. Before the user runs it, confirm they have:
+- `doctl` signed in with a **Write**-scoped API token (`doctl auth init`);
+- a Claude Pro/Max token from `claude setup-token` (**`sk-ant-oat01-…`**; an `sk-ant-api03` API key is rejected);
+- a password of 12+ characters that does not start with password/admin/trinity/changeme/letmein;
+- budget for about $48/month (`s-4vcpu-8gb`, since hosted mode needs 8 GB).
+
+Have them run the script from a release tag (`v0.9.5` or later, never an `-rc` tag; the pre-release rc4 **1-Click image** never served HTTPS, #2862). It takes about 6 minutes and times out at 15; on a timeout the droplet Console shows `tail -50 /var/log/trinity-install.log`. Afterwards walk them through "Secure this instance", the optional custom domain (A record, DNS-only on Cloudflare, Public URL, first visit), and hardening (tunnel / Tailscale + `PRIVATE_NETWORK_CIDRS` + `start.sh --provision --cloud digitalocean --caddy-only`). Everything is in `provision/digitalocean.md` → "One-command install". Do not run the script yourself: it prompts for secrets, and the user should type them.
 
 ### 2. Read the Guide
 

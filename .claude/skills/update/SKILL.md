@@ -147,7 +147,7 @@ If anything is listed, the fleet is on a stale agent runtime until the base imag
 
 Adoption rules (v0.9.0, #1809 / #1860 / #1816): a **cold stop → start** of an agent detects the rebuilt image and recreates the container (`recreate_reason: "image_drift"`); Operating Room → **Restart All** routes through the same lifecycle; `trinity-system` adopts on its next stop/start. A start of an already-*running* agent never image-recreates it. For a controlled wave that preserves run state (stopped agents stay stopped), use `/rebuild-agent` — do **not** run `docker restart agent-*` (a plain restart adopts nothing). Report which path you took and whether the user wants the wave now; the base-image rebuild itself is safe to run immediately.
 
-**Crossing 0.9.0 → 0.9.5 the rebuild + wave is not optional** — arm64 native binary (#2537), guardrail hooks in `/etc/claude-code/managed-settings.json` (ent#345), pre-installed Trinity plugin (ent#411), Codex `auth.json` (#2333), wedge diagnostics (#2503), the 11-tool deny list (#2476), the sanitizer ReDoS fix (#2398) and parked-call tracking (#2435) all ship in the image. Hosted installs got the new base image from `start.sh --hosted` in step 8; the wave is still needed. After the wave:
+**Crossing 0.9.0 → 0.9.5 the rebuild + wave is not optional** — arm64 native binary (#2537), guardrail hooks in `/etc/claude-code/managed-settings.json` (ent#345), pre-installed Trinity plugin (ent#411), Codex `auth.json` (#2333), wedge diagnostics (#2503), the 11-tool deny list (#2476), the sanitizer ReDoS fix (#2398), parked-call tracking (#2435), the `git-credential-trinity` helper (ent#615), the lock-free `git status` read (#2742) and the comma-separated `allowed-tools` parse (#2850) all ship in the image. Hosted installs got the new base image from `start.sh --hosted` in step 8; the wave is still needed. After the wave:
 
 ```bash
 # every agent should log `GUARDRAILS: registration verified`; ERROR = still on the old image (and NO hooks run)
@@ -163,6 +163,28 @@ Agents created on ≥ 0.9.5 are `unless-stopped`; pre-upgrade containers keep `R
 ```
 
 Runbook on the server: `docs/migrations/AGENT_RESTART_POLICY_2026-09.md`. Tell the user: from now on **never `docker compose down`** on this host (a recreated agent network sends every agent into a dockerd restart loop) — `stop.sh` / `compose stop` instead.
+
+### 8d. Git Remote Token Scrub (v0.9.5, ent#615 — automatic, verify only)
+
+The backend rewrites every agent's remote without the token, starting about 20s after boot. Old-image containers are covered too, because it installs the credential helper into them. Nothing to run. After step 11, check the report:
+
+```bash
+./scripts/run.sh "sudo docker logs trinity-backend --tail 3000 2>&1 | grep 'ent#615: remote-token sweep' | tail -20"
+```
+
+Flag any report with:
+- `refused` > 0 — the agent needs its own token (Git tab);
+- `gitmodules_hits` > 0 — rotating the platform token becomes **mandatory**;
+- `root_readable=0` — the sweep could not look, so check that agent's remotes by hand.
+
+Also flag operator-queue items `ent615-git-token-scrub-*`. See CLAUDE.md → Troubleshooting → "Git fetch/push fails…".
+
+**Tell the user to rotate the platform GitHub token** (Settings → GitHub, then revoke the old one on GitHub). It used to sit in `.git/config`, process listings, log archives and `/data/skills-library/*/.git/config`, so old backups still hold it. Runbook: `docs/migrations/GIT_REMOTE_TOKEN_SCRUB_2026-09.md`.
+
+Also mention for 0.9.5:
+- `WORKSPACE_ENABLED` is retired; delete it from `.env`.
+- Users must re-login and reconnect MCP clients.
+- The first headroom sweep may file critical `_sub-headroom` items for over-limit subscriptions (#2419).
 
 ### 9. Restart Services (source build only)
 

@@ -111,6 +111,13 @@ IMG_VER=$(echo "$VER_JSON" | jq -r '.image_version // "?"' 2>/dev/null || echo "
 ENC_LOG=$(run "sudo docker logs trinity-backend --tail 500 2>&1 | grep -E 'ent#435|MissingEncryptionKeyError' | tail -2" 2>/dev/null || true)
 # PostgreSQL only: two alembic heads means `upgrade head` silently applied nothing (0043/0044 fork, merged by 0045)
 HEADS=$(run "sudo docker exec trinity-backend alembic heads 2>/dev/null | grep -c head" 2>/dev/null | tr -d '[:space:]' || echo 0)
+# ent#615 (v0.9.5): the git remote token scrub runs ~20s after each backend boot and logs
+# one counts-only report per running git agent. Wait for it (up to 30s), then pick out
+# the reports that rewrote something (→ rotate the platform token) or need a human
+# (refused / unreadable workspace / token in a tracked .gitmodules).
+SCRUB_LOG='sudo docker logs trinity-backend --since 10m 2>&1'
+SCRUBBED=$(run "for i in 1 2 3 4 5 6; do $SCRUB_LOG | grep -q 'ent#615: remote-token sweep for' && break; sleep 5; done; $SCRUB_LOG | grep 'ent#615: remote-token sweep for' | grep -cE \"'(remotes_scrubbed|harvested)': [1-9]\"" 2>/dev/null | tr -d '[:space:]' || echo 0)
+SCRUB_BAD=$(run "$SCRUB_LOG | grep -E \"ent#615: remote-token sweep for .*('refused': [1-9]|'root_readable': 0)|ent#615: .*TRACKED .gitmodules\" | sed -E 's/^.*ent#615: (remote-token sweep for )?([^ :]+).*/\2/' | sort -u | tr '\n' ' '" 2>/dev/null || true)
 
 echo ""
 echo -e "${BLUE}══════════════════════════════════════${NC}"
@@ -127,6 +134,15 @@ if [ -n "$IMG_VER" ] && [ "$IMG_VER" != "?" ] && [ "$IMG_VER" != "null" ] && [ "
 fi
 if [ "${HEADS:-0}" -gt 1 ] 2>/dev/null; then
     echo -e "  ${RED}✗${NC} alembic reports $HEADS heads — migrations are NOT applying (need the 0045 merge revision)"
+fi
+if [ "${SCRUBBED:-0}" -gt 0 ] 2>/dev/null; then
+    echo -e "  ${YELLOW}⚠${NC} Git token scrub (ent#615) rewrote remotes on $SCRUBBED agent(s)."
+    echo -e "    → rotate the platform GitHub token (Settings → GitHub), then revoke the old one;"
+    echo -e "      it sat in .git/config, process listings, log archives and old backups"
+fi
+if [ -n "${SCRUB_BAD// /}" ]; then
+    echo -e "  ${RED}✗${NC} Git token scrub needs attention: ${SCRUB_BAD}"
+    echo -e "    (refused / unreadable workspace / token in tracked .gitmodules — CLAUDE.md → 'Git fetch/push fails')"
 fi
 if [ -n "$ENC_LOG" ] && [ "$BACKEND" = "200" ]; then
     echo -e "  ${YELLOW}⚠${NC} $ENC_LOG"

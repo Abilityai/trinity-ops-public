@@ -134,6 +134,12 @@ Rolling back across a version that changed `docker/base-image/` leaves agents on
 
 **Rolling back across v0.9.5's secret-settings migration (ent#435 / #2330) needs the pre-update database.** The migration *deletes* the plaintext `anthropic_api_key` / `github_pat` / `google_api_key` / `slack_*` rows after wrapping them into `<key>_encrypted`; pre-0.9.5 code reads only the plaintext rows, so on a post-migration DB it silently falls back to the env-var values (or nothing). Restore the pre-update artifact (`/data/backups/pre-migration-<ts>.db` or the `/update` backup) in step 8, or re-enter those credentials in Settings after the rollback. Rolling *forward* again is safe: the read path lazily re-encrypts any plaintext it finds.
 
+**Rolling back across the ent#615 git token scrub is safe for existing agents.** Their remotes are already credential-less, and the `trinity` helper stays installed in their containers (`/etc/gitconfig` is not touched by a backend downgrade). Two things do change:
+- The old backend writes token-bearing URLs again for *new* remote writes.
+- An agent **recreated on a pre-0.9.5 base image** loses the helper. It then needs `GITHUB_PAT` in its `.env` or baked environment, which normal token propagation supplies.
+
+If the base image is also rolled back, check `git fetch` on a couple of agents afterwards.
+
 **Hosted installs** (`docker-compose.hosted.yml`, #2280): there is nothing to build — set `TRINITY_IMAGE_TAG` in the server `.env` to the previous release tag (`v0.9.0`, `0.9.0`, or the exact `sha-<short>`) and re-run `start.sh --hosted`, which also pulls that release's agent base image. The `git reset` in step 7 only matters for the bind-mounted `config/` tree.
 
 ### 10. Verify Health
