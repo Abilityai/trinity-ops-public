@@ -69,7 +69,10 @@ source .env
 TRINITY=${TRINITY_PATH:-~/trinity}
 ./scripts/run.sh "cd $TRINITY && git log -1 --oneline"
 # #1814: version = code in service, image_version = build it runs inside; DIFFERENT ⇒ stale image (run /update's rebuild step)
-./scripts/run.sh "curl -s http://localhost:${BACKEND_PORT:-8000}/api/version | jq -c '{version, image_version, git_commit_short, edition}'"
+# #2380: install_source = do-marketplace | vultr-marketplace | do-script | script | unknown (first-boot, immutable)
+./scripts/run.sh "curl -s http://localhost:${BACKEND_PORT:-8000}/api/version | jq -c '{version, image_version, git_commit_short, edition, install_source}'"
+# hosted install? (docker-compose.hosted.yml, #2280) — then TRINITY_IMAGE_TAG is the version selector and must be pinned
+./scripts/run.sh "sudo docker inspect trinity-backend --format '{{index .Config.Labels \"com.docker.compose.project.config_files\"}}' 2>/dev/null; grep -E '^TRINITY_IMAGE_TAG=' ${TRINITY_PATH:-~/trinity}/.env 2>/dev/null || true"
 ```
 
 ### 7. Summary Output
@@ -85,7 +88,7 @@ TRINITY=${TRINITY_PATH:-~/trinity}
 | Scheduler | ✓/✗ (INTERNAL_API_SECRET OK/MISSING) |
 
 ### Version
-{commit} · API {version} (image {image_version}{, STALE IMAGE if different})
+{commit} · API {version} (image {image_version}{, STALE IMAGE if different}) · {source build | hosted @ TRINITY_IMAGE_TAG} · install_source {…}
 
 ### Containers
 {table}

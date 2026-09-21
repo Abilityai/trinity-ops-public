@@ -47,6 +47,8 @@ source .env
 ./scripts/run.sh "cd $TRINITY && sudo docker compose -f $COMPOSE up -d backend frontend mcp-server scheduler"
 ```
 
+**Never `docker compose down`** (v0.9.5, #2541): agent containers are `unless-stopped`, and `down` recreates `trinity-agent-network` with a new id — every agent then fails to start with `network … not found` and dockerd retries it in a backoff loop while the roster shows it as merely *stopped*. To stop the whole stack use `docker compose -f $COMPOSE stop` (upstream's `scripts/deploy/stop.sh`). If a `down` already happened: `sudo docker rm -f` the flapping `agent-*` containers (volumes survive), then `POST /api/ops/fleet/restart`.
+
 ### 4. Wait and Verify
 
 ```bash

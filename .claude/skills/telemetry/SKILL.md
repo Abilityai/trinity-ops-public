@@ -19,10 +19,12 @@ ls -la .env scripts/run.sh 2>/dev/null
 
 ```bash
 source .env
-./scripts/run.sh "curl -s http://localhost:${BACKEND_PORT:-8000}/api/telemetry/host"
+# Authenticated (SEC-180) — mint the admin token on the host so no tunnel is needed
+./scripts/run.sh "TOKEN=\$(curl -s -X POST http://localhost:${BACKEND_PORT:-8000}/token -H 'Content-Type: application/x-www-form-urlencoded' -d 'username=admin&password=$ADMIN_PASSWORD' | jq -r '.access_token // empty'); \
+  curl -s -H \"Authorization: Bearer \$TOKEN\" http://localhost:${BACKEND_PORT:-8000}/api/telemetry/host"
 ```
 
-Returns JSON with CPU, memory, disk stats.
+Returns JSON with CPU, memory, disk stats. (A read-only `ops`-scoped MCP key also reaches this route, #2323 — useful for an external monitor.)
 
 ### 3. Container Stats
 
