@@ -6,9 +6,10 @@ allowed-tools: Bash, Read, Write, Edit
 automation: gated
 argument-hint: (no args — runs against the instance configured in .env)
 metadata:
-  version: "1.2"
-  updated: 2026-06-19
+  version: "1.3"
+  updated: 2026-10-09
   changelog:
+    - "1.3: Hosted installs with the bundled PostgreSQL (post-0.9.5 dev, #3159). Phase 0 detects the bundled server and refuses unless the backend is still on SQLite; Phase 1 reuses the compose-managed trinity-postgres and its POSTGRES_PASSWORD instead of starting a second container of the same name; the selector flip replaces the empty DATABASE_URL= line that start.sh --hosted writes; rollback writes DATABASE_URL= (empty) because an absent line means bundled PostgreSQL on hosted; cleanup never removes the bundled container or volume. Phase 0 disk check is bind-mount aware."
     - "1.2: Adapted for the public single-instance ops agent — single root .env + scripts/run.sh (local or remote), auto-detect bind-mount vs named volume (trinity_trinity-data), deploy log under deploys/, host backups under ~/backups/. Removed fleet-only machinery (multi-instance layout, external secret vault, external monitoring). Schema bootstrap stays init_schema_postgres (DDL-only); on first boot the backend stamps Alembic over the pre-existing schema (#1183)."
     - "1.1: Snapshots run as root (--user 0:0); ETL skips EMPTY orphan tables (process_* are scheduler-created, not in schema.py) and hard-fails only on NON-EMPTY drift; local expansion of $ADMIN_PASSWORD in the post-cutover check; downtime estimate includes the snapshot."
     - "1.0: Initial version."
@@ -28,7 +29,8 @@ Stand up PostgreSQL **next to** the running instance, prove the data pipeline on
 - **Two-pass copy.** The trial pass (Phase 2) proves schema bootstrap + ETL + connectivity and times the copy. The cutover pass (Phase 3) re-copies from a fresh quiescent snapshot — the trial data is discarded. Never "top up" a trial copy.
 - **No parallel "green" backend.** A second backend would share Redis and the Docker socket, and its cleanup/watchdog services would act on *real* agents and slots based on half-empty PG data. Validation is data-fidelity-level; app-level validation happens immediately post-cutover with rollback armed.
 - **Schema comes from Trinity's own code** (`db.schema.init_schema_postgres()` — schema.py is the single DDL source). The ETL copies **data only**, never DDL. `init_schema_postgres` builds the tables *empty* (no admin seed), which is what the ETL needs. On first boot the backend's `init_database()` runs the Alembic runner, which detects the pre-existing schema and **stamps `0001_baseline`** rather than rebuilding (#1183) — so no schema conflict. On PG there is **no `schema_migrations` table** (that is SQLite-only); Alembic state lives in `alembic_version`. This is correct, not a fault.
-- **Backend selection is one env var.** `DATABASE_URL` set → PostgreSQL (backend *and* scheduler); unset → SQLite. Non-sticky, non-destructive in both directions.
+- **Backend selection is one env var.** `DATABASE_URL` set → PostgreSQL (backend *and* scheduler); unset → SQLite. Non-sticky, non-destructive in both directions. **Hosted stack on post-0.9.5 dev (#3159) is the exception:** there an *absent* line means the bundled PostgreSQL and only an *empty* `DATABASE_URL=` means SQLite. This skill therefore always writes the line explicitly, in both directions, and never deletes it.
+- **Two modes, detected in Phase 0.** *Standalone* (prod compose, or hosted before #3159): the skill starts its own `trinity-postgres` container. *Bundled* (hosted compose that already defines `trinity-postgres`): the server, its volume `trinity_postgres-data` and its password belong to compose. The skill reuses them and must never `docker run`, `docker rm` or `docker volume rm` anything named `trinity-postgres`.
 - **The dispatch-window caveat:** anything written to PG between cutover and a later rollback stays in PG only (preserved in the volume, not merged back). Keep the post-cutover validation window short and deliberate.
 - **Agents never touch the DB** — agent containers are unaffected. Redis, Vector, frontend, MCP server are unaffected (MCP talks to the backend over HTTP). Postgres joins `trinity-platform-network` only, so agents cannot route to it (#589).
 
@@ -40,7 +42,7 @@ Stand up PostgreSQL **next to** the running instance, prove the data pipeline on
 | Remote Trinity env | `${TRINITY_PATH:-~/trinity}/.env` | Yes | Yes | Gains `DATABASE_URL` at cutover (config-only change — allowed) |
 | PG credentials file | `${TRINITY_PATH:-~/trinity}/.env.pg-credentials` (host, 600) | Yes | Yes | Generated password; never passes through local shell args |
 | SQLite snapshots | `~/backups/pg-{trial,cutover}-*.db` (host) | Yes | Yes | ETL sources; also serve as backups |
-| Postgres container | `trinity-postgres` + `trinity-postgres-data` volume | Yes | Yes | Created by Phase 1 |
+| Postgres container | `trinity-postgres` + `trinity-postgres-data` volume (standalone) · compose-managed `trinity-postgres` + `trinity_postgres-data` (bundled) | Yes | Yes | Created by Phase 1 in standalone mode; pre-existing and only reused in bundled mode |
 | ETL script | `.claude/skills/migrate-to-postgres/scripts/sqlite_to_pg_etl.py` | Yes | No | Shipped to the host at `/tmp/sqlite_to_pg_etl.py` per run |
 | Migration log | `deploys/<ts>-postgres-migration.md` | No | Yes | Full report: rowcounts, timings, snapshots, decisions |
 | Ops CLAUDE.md | `./CLAUDE.md` | Yes | Yes | Gains a "This instance runs PostgreSQL" note post-cutover |
@@ -80,22 +82,44 @@ COMPOSE=${COMPOSE_FILE:-docker-compose.prod.yml}
 ./scripts/run.sh "sudo docker exec trinity-scheduler python3 -c 'import psycopg2; print(\"scheduler-image-ok\")'"
 # If either fails: the image predates #1093 — /update (rebuild) first. Do not proceed.
 
-# 5. Disk + DB size baseline
+# 5. Disk + DB size baseline (read through the backend's own /data mount — correct for
+#    both the dev named volume and a prod/hosted bind mount)
 ./scripts/run.sh "df -h /"
-./scripts/run.sh "sudo docker run --rm -v trinity_trinity-data:/data alpine ls -lh /data/trinity.db 2>/dev/null || true"
+./scripts/run.sh "sudo docker exec trinity-backend ls -lh /data/trinity.db 2>/dev/null || true"
 
 # 6. Canary must be OFF (its snapshot reader is SQLite-only — known #300 gap)
 ./scripts/run.sh "sudo docker exec trinity-backend printenv CANARY_ENABLED || echo 'unset (ok)'"
 
 # 7. Platform network present?
 ./scripts/run.sh "sudo docker network ls --format '{{.Name}}' | grep platform"   # expect: trinity-platform-network
+
+# 8. Mode: does the compose file already define the PostgreSQL server? (hosted, #3159)
+PG_MODE=$(./scripts/run.sh "grep -q 'container_name: trinity-postgres' $TRINITY/$COMPOSE && echo bundled || echo standalone" | tr -d '[:space:]')
+echo "mode: $PG_MODE"
+
+# 9. The backend must still be on SQLite. In bundled mode this is the guard that keeps
+#    Phase 2's schema wipe away from a live database.
+./scripts/run.sh "sudo docker exec trinity-backend python3 -c 'import db.engine as e; print(\"is_sqlite:\", e.is_sqlite())'"   # expect True
+./scripts/run.sh "grep -nE '^[[:space:]]*(export[[:space:]]+)?DATABASE_URL=' $TRINITY/.env || echo 'no DATABASE_URL line'"
 ```
 
-Abort conditions: unhealthy backend, missing #1093 (code OR image), `CANARY_ENABLED=1`, <3× SQLite size free disk.
+Abort conditions: unhealthy backend, missing #1093 (code OR image), `CANARY_ENABLED=1`, <3× SQLite size free disk, **`is_sqlite: False`** (the instance is already on PostgreSQL — there is nothing to migrate, and continuing would wipe live data), or bundled mode with a non-empty `DATABASE_URL`. In bundled mode on SQLite the expected line is an empty `DATABASE_URL=`.
 
 **[APPROVAL GATE 1]** Present: pre-flight results, DB size, estimated trial-copy time, the downtime model, and the rollback story. Proceed only on explicit approval.
 
 ### Phase 1: Provision PostgreSQL (additive — Trinity untouched)
+
+**Bundled mode (hosted, #3159): skip the `docker run` below.** The compose-managed `trinity-postgres` is already running idle beside the SQLite install. Only link its password into the credentials file the later phases read, confirm it is ready, and run the isolation check:
+
+```bash
+source .env
+TRINITY=${TRINITY_PATH:-~/trinity}
+./scripts/run.sh "umask 077 && PW=\$(grep -E '^POSTGRES_PASSWORD=' $TRINITY/.env | tail -1 | cut -d= -f2- | tr -d '\"') && [ -n \"\$PW\" ] && echo \"TRINITY_PG_PASSWORD=\$PW\" > $TRINITY/.env.pg-credentials && echo linked || echo 'POSTGRES_PASSWORD missing from .env — run start.sh --hosted once, then retry'"
+./scripts/run.sh "sudo docker exec trinity-postgres pg_isready -h 127.0.0.1 -U trinity -d trinity"
+./scripts/run.sh "A=\$(sudo docker ps --format '{{.Names}}' | grep '^agent-' | head -1); [ -z \"\$A\" ] && echo 'no agents to test' || (sudo docker exec \$A getent hosts postgres && echo 'WARNING: agent can resolve postgres!' || echo isolation-ok)"
+```
+
+The bundled server answers on the same `postgres` hostname with DB and user `trinity`, so Phases 2 and 3 run unchanged. **Standalone mode** continues here:
 
 Generate the password **on the host** (never through local shell args) and start the container. This mirrors the dev-compose `postgres` profile service (`postgres:16-alpine`, platform network only — agents cannot route there, #589). We run it standalone because prod compose ships no postgres service, and patching the on-instance compose file is forbidden (diverges `~/trinity`, breaks `/update`).
 
@@ -192,8 +216,10 @@ if [ "$MOUNT_TYPE" = "bind" ]; then DATA_MOUNT="$TRINITY/trinity-data"; else DAT
 # MUST print "ETL OK". Non-zero exit => do NOT switch; restart on SQLite
 # (docker compose up -d backend scheduler) and return to Phase 2.
 
-# 6. Flip the selector
-./scripts/run.sh "source $TRINITY/.env.pg-credentials && grep -q '^DATABASE_URL=' $TRINITY/.env && echo 'DATABASE_URL already set — STOP and inspect' || echo \"DATABASE_URL=postgresql://trinity:\$TRINITY_PG_PASSWORD@postgres:5432/trinity\" >> $TRINITY/.env"
+# 6. Flip the selector. A NON-empty DATABASE_URL means someone already chose a server: stop.
+#    An empty `DATABASE_URL=` line (what start.sh --hosted writes for a SQLite keeper) is
+#    replaced; no line at all (prod) is appended.
+./scripts/run.sh "source $TRINITY/.env.pg-credentials && if grep -qE '^DATABASE_URL=.+' $TRINITY/.env; then echo 'DATABASE_URL already set — STOP and inspect'; else sed -i '/^DATABASE_URL=/d' $TRINITY/.env && echo \"DATABASE_URL=postgresql://trinity:\$TRINITY_PG_PASSWORD@postgres:5432/trinity\" >> $TRINITY/.env && echo flipped; fi"
 
 # 7. Recreate with the new env (env changes need recreation, not restart)
 ./scripts/run.sh "cd $TRINITY && sudo docker compose -f $COMPOSE up -d backend scheduler"
@@ -232,10 +258,12 @@ echo "token length: ${#TOKEN}"   # expect ~140+, NOT 4
 source .env
 TRINITY=${TRINITY_PATH:-~/trinity}
 COMPOSE=${COMPOSE_FILE:-docker-compose.prod.yml}
-# Rollback — one line, SQLite file was never touched
-./scripts/run.sh "sed -i '/^DATABASE_URL=/d' $TRINITY/.env && cd $TRINITY && sudo docker compose -f $COMPOSE up -d backend scheduler"
+# Rollback — one line, SQLite file was never touched. The selector is rewritten as an
+# EMPTY `DATABASE_URL=`, never removed: on the hosted stack an absent line selects the
+# bundled PostgreSQL (#3159), and an empty one means SQLite on every stack.
+./scripts/run.sh "sed -i '/^DATABASE_URL=/d' $TRINITY/.env && echo 'DATABASE_URL=' >> $TRINITY/.env && cd $TRINITY && sudo docker compose -f $COMPOSE up -d backend scheduler"
 ./scripts/run.sh "sudo docker exec trinity-backend python3 -c 'import db.engine as e; print(\"is_sqlite:\", e.is_sqlite())'"   # expect True
-# Anything written during the PG window stays in the trinity-postgres-data volume (not merged back).
+# Anything written during the PG window stays in the PostgreSQL volume (not merged back).
 ```
 
 ### Phase 4: Post-cutover hardening
@@ -265,7 +293,7 @@ Then, without printing the secrets:
    - Append a **"This instance runs PostgreSQL"** note to `./CLAUDE.md` (under the *Database Backend* section): psql access (`sudo docker exec trinity-postgres psql -U trinity -d trinity`), the `pg_dump` backup command, an explicit warning that the SQLite recipes in *Database Operations* and the `/backup` / `/rollback` skills' DB steps **do not apply** until adapted, that canary stays disabled, and the frozen SQLite file's location + cutover date.
    - Write the migration log to `deploys/<ts>-postgres-migration.md`: rowcount table, timings, snapshot filenames, gate decisions, validation evidence.
 5. **Do NOT delete** the SQLite database — it is the rollback artifact. It goes stale from cutover; label it in `./CLAUDE.md`. Revisit removal after ~30 days of stable PG operation.
-6. **Follow-ups:** `scripts/backup.sh` (and therefore `/update`'s pre-update step) is PG-aware for the *bundled* `trinity-postgres` (`pg_dump -Fc`), and the platform's nightly job covers PG automatically (v0.9.0+). `/rollback`'s DB-restore step still assumes SQLite — for PG, `pg_restore` into an empty database with backend+scheduler stopped (CLAUDE.md → Backup Database).
+6. **Follow-ups:** `scripts/backup.sh` (and therefore `/update`'s pre-update step) is PG-aware for the *bundled* `trinity-postgres` (`pg_dump -Fc`), and the platform's nightly job covers PG automatically (v0.9.0+). For a PostgreSQL restore see `/rollback` step 5 and CLAUDE.md → Backup Database (which `pg_restore` can read a dump depends on which client wrote it).
 
 ---
 
@@ -276,7 +304,12 @@ Nothing in Phases 0–2 touches the running instance. To abort cleanly:
 ```bash
 source .env
 TRINITY=${TRINITY_PATH:-~/trinity}
+# STANDALONE mode only — this skill created the container and the volume:
 ./scripts/run.sh "sudo docker rm -f trinity-postgres && sudo docker volume rm trinity-postgres-data && rm -f $TRINITY/.env.pg-credentials /tmp/sqlite_to_pg_etl.py"
+# BUNDLED mode (hosted, #3159) — the container and volume belong to compose. NEVER remove
+# them: the hosted file will not render or start without the service. Drop only the trial
+# data and this skill's own files:
+./scripts/run.sh "sudo docker exec trinity-postgres psql -U trinity -d trinity -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;' && rm -f $TRINITY/.env.pg-credentials /tmp/sqlite_to_pg_etl.py"
 # Snapshots in ~/backups can stay (they are valid backups) or be pruned.
 ```
 
@@ -285,7 +318,8 @@ TRINITY=${TRINITY_PATH:-~/trinity}
 | Failure | State | Action |
 |---------|-------|--------|
 | Phase 0 check fails | Nothing changed | Fix prerequisite (usually `/update` for code+images), re-run |
-| Phase 1 container won't start | Additive only | `sudo docker logs trinity-postgres`; fix; `docker rm -f` and retry |
+| Phase 1 container won't start | Additive only | `sudo docker logs trinity-postgres`; fix; `docker rm -f` and retry (standalone mode only — in bundled mode fix it through `start.sh --hosted`, never `docker rm`) |
+| Phase 1 `docker run` says the name `trinity-postgres` is already in use | Nothing changed | The instance is hosted with the bundled server (#3159): you are in bundled mode. Use the bundled branch of Phase 1 |
 | Phase 2 ETL fails (drift/coercion/mismatch) | PG dirty, instance untouched | Investigate the printed table/column/row context; re-run Phase 2 from the wipe step |
 | Phase 3 ETL fails | Backend+scheduler stopped, SQLite intact, `DATABASE_URL` not yet set | `docker compose up -d backend scheduler` → back on SQLite; return to Phase 2 |
 | Phase 3 validation fails | On PG, rollback armed | Gate 3 ROLLBACK path; instance back on SQLite in ~1 min |

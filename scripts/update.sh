@@ -8,7 +8,10 @@
 #                   upgrade IS `start.sh --hosted` (it pulls the platform images AND the
 #                   agent base image and retags it; a bare `docker compose pull` leaves
 #                   every agent on the old runtime). TRINITY_IMAGE_TAG in the server
-#                   .env selects the release — pin it.
+#                   .env selects the release — pin it. The checkout must move with it
+#                   (compose file + mounted config/), so a pinned tag is checked out
+#                   rather than pulled: marketplace and one-command installs are
+#                   `--depth 1 --branch <tag>` clones with a detached HEAD.
 
 set -e
 
@@ -53,10 +56,32 @@ else
     exit 1
 fi
 
-# 2. Pull
-echo -e "\n${YELLOW}[2/5] Pulling $BRANCH...${NC}"
+# 2. Pull (source build) / check out the pinned release tag (hosted)
 BEFORE=$(run "cd $TRINITY && git log -1 --oneline")
-run "cd $TRINITY && git pull origin $BRANCH"
+if [ "$HOSTED" = 1 ]; then
+    # Last TRINITY_IMAGE_TAG line wins (upstream's upgrade guide appends a new one).
+    TAG=$(run "grep -E '^TRINITY_IMAGE_TAG=' $TRINITY/.env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\"'" 2>/dev/null | tr -d '[:space:]')
+    ON_BRANCH=$(run "cd $TRINITY && git symbolic-ref -q --short HEAD || true" 2>/dev/null | tr -d '[:space:]')
+    if [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+ ]]; then
+        GIT_TAG="v${TAG#v}"
+        echo -e "\n${YELLOW}[2/5] Checking out $GIT_TAG (TRINITY_IMAGE_TAG=$TAG)...${NC}"
+        # --depth 1 only on a shallow clone; on a full clone it would truncate history.
+        if ! run "cd $TRINITY && D=''; [ \"\$(git rev-parse --is-shallow-repository)\" = true ] && D='--depth 1'; git fetch \$D origin tag $GIT_TAG && git checkout -q $GIT_TAG"; then
+            # A moving image tag such as 0.9 has no git tag; a wrong one fails at the image pull below.
+            echo -e "  ${YELLOW}⚠${NC} could not check out $GIT_TAG — the checkout stays at ${BEFORE%% *}; the compose file and config/ may not match the images"
+        fi
+    elif [ -n "$ON_BRANCH" ]; then
+        echo -e "\n${YELLOW}[2/5] Pulling $BRANCH (TRINITY_IMAGE_TAG is '${TAG:-unset}', not a release tag)...${NC}"
+        run "cd $TRINITY && git pull origin $BRANCH"
+    else
+        echo -e "\n${YELLOW}[2/5] Checkout left as is${NC}"
+        echo -e "  ${YELLOW}⚠${NC} detached HEAD and TRINITY_IMAGE_TAG='${TAG:-unset}' — nothing to check out."
+        echo -e "    Pin a release tag in $TRINITY/.env so the compose file and config/ move with the images."
+    fi
+else
+    echo -e "\n${YELLOW}[2/5] Pulling $BRANCH...${NC}"
+    run "cd $TRINITY && git pull origin $BRANCH"
+fi
 AFTER=$(run "cd $TRINITY && git log -1 --oneline")
 if [ "$BEFORE" = "$AFTER" ]; then
     echo -e "  ${YELLOW}⚠${NC} Already up to date"
@@ -73,7 +98,6 @@ if [ "$HOSTED" = 1 ]; then
     # 3+4. Hosted: start.sh --hosted pulls platform images + agent base (retagged
     #      trinity-agent-base:latest) and brings the stack up. Never `compose pull`.
     echo -e "\n${YELLOW}[3/5] Pulling prebuilt images + starting (start.sh --hosted)...${NC}"
-    TAG=$(run "grep -E '^TRINITY_IMAGE_TAG=' $TRINITY/.env 2>/dev/null | cut -d= -f2- | tr -d '\"'" 2>/dev/null | tr -d '[:space:]')
     [ -z "$TAG" ] && echo -e "  ${YELLOW}⚠${NC} TRINITY_IMAGE_TAG unset — 'latest' moves on every release; pin it in $TRINITY/.env" || echo "  TRINITY_IMAGE_TAG=$TAG"
     run "cd $TRINITY && sudo ./scripts/deploy/start.sh --hosted --unattended"
     echo -e "  ${GREEN}✓${NC} hosted stack up"
@@ -117,6 +141,16 @@ HEADS=$(run "sudo docker exec trinity-backend alembic heads 2>/dev/null | grep -
 # (refused / unreadable workspace / token in a tracked .gitmodules).
 SCRUB_LOG='sudo docker logs trinity-backend --since 10m 2>&1'
 SCRUBBED=$(run "for i in 1 2 3 4 5 6; do $SCRUB_LOG | grep -q 'ent#615: remote-token sweep for' && break; sleep 5; done; $SCRUB_LOG | grep 'ent#615: remote-token sweep for' | grep -cE \"'(remotes_scrubbed|harvested)': [1-9]\"" 2>/dev/null | tr -d '[:space:]' || echo 0)
+# Post-0.9.5 dev. ent#720 (Alembic 0085): duplicate sign-in emails are cleared at boot — those
+# accounts lose email sign-in until they re-bind. #3159: on a hosted stack that bundles
+# PostgreSQL, an ABSENT DATABASE_URL line means "bundled PostgreSQL"; a SQLite keeper must
+# carry an empty `DATABASE_URL=`.
+EMAIL_CLEARED=$(run "sudo docker logs trinity-backend --since 10m 2>&1 | grep -c 'ent#720.*duplicate sign-in email'" 2>/dev/null | tr -d '[:space:]' || echo 0)
+DB_KIND=$(run "sudo docker exec trinity-backend printenv DATABASE_URL 2>/dev/null | grep -q '^postgresql' && echo postgresql || echo sqlite" 2>/dev/null | tr -d '[:space:]')
+SELECTOR_MISSING=0
+if [ "$HOSTED" = 1 ]; then
+    SELECTOR_MISSING=$(run "grep -q 'container_name: trinity-postgres' $TRINITY/$COMPOSE && ! grep -qE '^[[:space:]]*(export[[:space:]]+)?DATABASE_URL=' $TRINITY/.env && [ -f ${TRINITY}/trinity-data/trinity.db ] && echo 1 || echo 0" 2>/dev/null | tr -d '[:space:]')
+fi
 SCRUB_BAD=$(run "$SCRUB_LOG | grep -E \"ent#615: remote-token sweep for .*('refused': [1-9]|'root_readable': 0)|ent#615: .*TRACKED .gitmodules\" | sed -E 's/^.*ent#615: (remote-token sweep for )?([^ :]+).*/\2/' | sort -u | tr '\n' ' '" 2>/dev/null || true)
 
 echo ""
@@ -129,6 +163,16 @@ else
 fi
 echo -e "  Scheduler: $SCHED"
 echo -e "  Version:   $VER (image: $IMG_VER)"
+echo -e "  Database:  ${DB_KIND:-?}"
+if [ "${SELECTOR_MISSING:-0}" = "1" ]; then
+    echo -e "  ${RED}✗${NC} trinity-data/trinity.db exists but $TRINITY/.env has no DATABASE_URL line."
+    echo -e "    On this hosted stack that selects the EMPTY bundled PostgreSQL (#3159). To stay on"
+    echo -e "    SQLite add an empty 'DATABASE_URL=' line and re-run start.sh --hosted."
+fi
+if [ "${EMAIL_CLEARED:-0}" -gt 0 ] 2>/dev/null; then
+    echo -e "  ${YELLOW}⚠${NC} ent#720 cleared a duplicate sign-in email on $EMAIL_CLEARED account(s) — they must re-bind it:"
+    echo -e "    docker logs trinity-backend 2>&1 | grep 'ent#720'"
+fi
 if [ -n "$IMG_VER" ] && [ "$IMG_VER" != "?" ] && [ "$IMG_VER" != "null" ] && [ "${IMG_VER%%+*}" != "$VER" ]; then
     echo -e "  ${YELLOW}⚠${NC} image_version differs from version — platform image is stale; re-run the build step"
 fi

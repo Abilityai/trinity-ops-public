@@ -21,7 +21,7 @@ A [Claude Code](https://claude.ai/code)-powered operations agent for managing a 
 - **Diagnose issues** — error scan across all services, resource usage, DB integrity
 - **Migrate the database** — move from SQLite to PostgreSQL with validation and one-line rollback
 - **Tunnel** — SSH port-forwarding for local browser access to remote instance
-- **Provision** — step-by-step guides for Hetzner, GCP, AWS, DigitalOcean, or localhost
+- **Provision** — step-by-step guides for Hetzner, GCP, AWS, DigitalOcean, Vultr, or localhost
 
 ## Getting Started
 
@@ -82,6 +82,7 @@ The agent reads `CLAUDE.md` as its system prompt — it knows how to operate Tri
 | **Google Cloud** | `provision/gcp.md` |
 | **AWS** | `provision/aws.md` |
 | **DigitalOcean** | `provision/digitalocean.md` |
+| **Vultr** | `provision/vultr.md` |
 | Any Linux VM with SSH | Set `.env` and go |
 
 ## Minimum Requirements
@@ -136,7 +137,8 @@ trinity-ops-public/
     ├── hetzner.md          # Hetzner Cloud
     ├── gcp.md              # Google Cloud
     ├── aws.md              # Amazon Web Services
-    └── digitalocean.md     # DigitalOcean
+    ├── digitalocean.md     # DigitalOcean
+    └── vultr.md            # Vultr
 ```
 
 ## Usage with Claude Code
