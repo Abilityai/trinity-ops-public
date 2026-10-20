@@ -64,17 +64,28 @@ source .env
 ./scripts/run.sh "sudo docker logs trinity-backend --tail 3000 2>&1 | grep 'ent#615: remote-token sweep' | grep -E \"'refused': [1-9]|'gitmodules_hits': [1-9]|'root_readable': 0\" | tail -5; true"
 # #2742 / #2800: sync-health poller errors (PG `integer out of range` = pre-0063 schema)
 ./scripts/run.sh "sudo docker logs trinity-backend --since 24h 2>&1 | grep -iE 'sync.?health.*(error|failed)|integer out of range' | tail -5; true"
-# Post-0.9.5 dev (#3113 / ent#752): the agent server's own /health reports the guardrail and
-# skill-gate registration; nothing in the platform reads these fields yet. A null means an old image.
+# v1.0.0 (#3113 / ent#752): the agent server's own /health reports the guardrail and
+# skill-gate registration (the Skills tab reads skill_gate_hook since v1.0.0: "not enforced").
+# A null means an old image.
 ./scripts/run.sh "for c in \$(sudo docker ps --format '{{.Names}}' | grep '^agent-'); do echo \"\$c \$(sudo docker exec \$c curl -s -m 5 localhost:8000/health 2>/dev/null | jq -c '[.guardrails_registration, .skill_gate_hook]' 2>/dev/null)\"; done"
-# Post-0.9.5 dev: image pins (Opus 5.5 needs Claude Code >= 2.1.280), pull loop, retained results
+# v1.0.0: image pins (Opus 5.5 needs Claude Code >= 2.1.280), pull loop, retained results
 ./scripts/run.sh "for c in \$(sudo docker ps --format '{{.Names}}' | grep '^agent-' | head -5); do echo \"\$c \$(sudo docker exec \$c claude --version 2>/dev/null | head -1) pull_loop=\$(sudo docker logs \$c 2>&1 | grep -c 'pull loop started')\"; done"
-# Post-0.9.5 dev: upgrade-time notices worth reading once (cleared sign-in emails, capped CPU,
+# v1.0.0: upgrade-time notices worth reading once (cleared sign-in emails, capped CPU,
 # unlabelled orphan volumes, refused agent self-changes, chain-depth refusals)
 ./scripts/run.sh "sudo docker logs trinity-backend --since 24h 2>&1 | grep -E 'ent#720|\[#2318\]|\[#3214\]|capability_refused|inter_agent_depth_exceeded|effect_unguarded' | tail -10; true"
+# v1.0.0: SUB-003 walking subscriptions (#3470 — 'image predates it' = old agent image),
+# completed_at clamps (#3589)
+./scripts/run.sh "sudo docker logs trinity-backend --since 24h 2>&1 | grep -E '\[#3470\]|\[#3589\]' | tail -10; true"
 ```
 
-Flag: any `guardrails_registration` or `skill_gate_hook` other than `ok` (a `null` pair means the agent is still on a pre-pin base image), any `ent#720 duplicate sign-in email` line (that account lost email sign-in), repeated `capability_refused` (an orchestrator agent needs a grant — CLAUDE.md → Self-change grants), any `no` policy, any `GUARDRAILS: ERROR`, any diagnostics events, a non-trivial parked/recovered count, any agent whose remote still carries a credential, or any sweep report with `refused` > 0, `gitmodules_hits` > 0 (**rotate the platform token**) or `root_readable` 0.
+v1.0.0 access checks (admin token): peer-skill calls refused since the upgrade, and `user`-role accounts that now get 403 `workspace_only` on operator routes:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api/skills/peer-grants/drift | jq
+curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api/users | jq -r '.[] | select(.role=="user") | .username'
+```
+
+Flag: any `guardrails_registration` or `skill_gate_hook` other than `ok` (a `null` pair means the agent is still on a pre-pin base image), any `ent#720 duplicate sign-in email` line (that account lost email sign-in), repeated `capability_refused` (an orchestrator agent needs a grant — CLAUDE.md → Self-change grants), any `no` policy, any `GUARDRAILS: ERROR`, any `did not apply the per-spawn credential` (#3470, old image), a non-empty peer-skill drift list (grant or accept the refusals — CLAUDE.md → Peer skill grants), a `user` account that operates agents (raise it to `operator`), any diagnostics events, a non-trivial parked/recovered count, any agent whose remote still carries a credential, or any sweep report with `refused` > 0, `gitmodules_hits` > 0 (**rotate the platform token**) or `root_readable` 0.
 
 ### 6. Disk Space
 
@@ -99,7 +110,7 @@ source .env
 
 ### 9. Database Integrity
 
-Backend-aware, and read through the backend's own `/data` mount so it is right for the dev named volume and for a prod or hosted bind mount alike. A hosted install on post-0.9.5 dev runs the bundled PostgreSQL unless it predates #3159.
+Backend-aware, and read through the backend's own `/data` mount so it is right for the dev named volume and for a prod or hosted bind mount alike. A hosted install on v1.0.0 runs the bundled PostgreSQL unless it predates #3159.
 
 ```bash
 source .env

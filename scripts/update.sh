@@ -141,7 +141,7 @@ HEADS=$(run "sudo docker exec trinity-backend alembic heads 2>/dev/null | grep -
 # (refused / unreadable workspace / token in a tracked .gitmodules).
 SCRUB_LOG='sudo docker logs trinity-backend --since 10m 2>&1'
 SCRUBBED=$(run "for i in 1 2 3 4 5 6; do $SCRUB_LOG | grep -q 'ent#615: remote-token sweep for' && break; sleep 5; done; $SCRUB_LOG | grep 'ent#615: remote-token sweep for' | grep -cE \"'(remotes_scrubbed|harvested)': [1-9]\"" 2>/dev/null | tr -d '[:space:]' || echo 0)
-# Post-0.9.5 dev. ent#720 (Alembic 0085): duplicate sign-in emails are cleared at boot — those
+# v1.0.0. ent#720 (Alembic 0085): duplicate sign-in emails are cleared at boot — those
 # accounts lose email sign-in until they re-bind. #3159: on a hosted stack that bundles
 # PostgreSQL, an ABSENT DATABASE_URL line means "bundled PostgreSQL"; a SQLite keeper must
 # carry an empty `DATABASE_URL=`.
@@ -192,6 +192,14 @@ if [ -n "$ENC_LOG" ] && [ "$BACKEND" = "200" ]; then
     echo -e "  ${YELLOW}⚠${NC} $ENC_LOG"
     echo -e "    → rotate every credential that was entered via Settings; old backups still hold plaintext"
 fi
+# v1.0.0: access changes that need a human decision after the upgrade (ent#837 / ent#662)
+case "$VER" in
+    1.*|[2-9].*)
+        echo -e "  ${YELLOW}⚠${NC} v1.0 access changes: role 'user' is now Workspace-only (raise operators:"
+        echo -e "    PUT /api/users/{username}/role), and peer calls to library skills need a grant —"
+        echo -e "    review GET /api/skills/peer-grants/drift (Settings → Agents). Re-login + reconnect MCP."
+        ;;
+esac
 if [ "${BASE_CHANGED:-0}" = "hosted" ]; then
     echo -e "\n  ${YELLOW}⚠${NC} Hosted: the agent base image was re-pulled. Agents adopt it on a cold stop/start"
     echo -e "    (Operating Room -> Restart All, or /rebuild-agent). Then: docker logs agent-x | grep GUARDRAILS:"

@@ -15,7 +15,7 @@ doctl account get               # Verify auth
 
 Upstream ships `scripts/deploy/trinity-do-create.sh` (#2380 / #2707). The user guide is at https://docs.ability.ai/getting-started/deploying/digitalocean; its source is `app/getting-started/deploying/digitalocean/page.tsx` in the `trinity-docs` repo.
 
-**Two versions of the script are in circulation.** Fetched from the `v0.9.5` tag it asks for a Claude subscription token and registers it for you. Fetched from a later (post-0.9.5 dev, #2867) tag it does not: there are three questions instead of four, the droplet's user-data carries only the admin password, and you connect Claude in the browser after signing in. A later-tag droplet also runs on the bundled PostgreSQL (#3159) rather than SQLite. Where the two differ, both are described below.
+**Two versions of the script are in circulation.** Fetched from the `v0.9.5` tag it asks for a Claude subscription token and registers it for you. Fetched from `v1.0.0` or later (#2867) it does not: there are three questions instead of four, the droplet's user-data carries only the admin password, and you connect Claude in the browser after signing in. A 1.0 droplet also runs on the bundled PostgreSQL (#3159) rather than SQLite. Where the two differ, both are described below.
 
 ### Before you run it
 
@@ -32,7 +32,7 @@ Upstream ships `scripts/deploy/trinity-do-create.sh` (#2380 / #2707). The user g
 bash <(curl -fsSL https://raw.githubusercontent.com/abilityai/trinity/<tag>/scripts/deploy/trinity-do-create.sh)
 ```
 
-`<tag>` is the release you want, e.g. `v0.9.5`, and the script deploys that same tag as its default `TRINITY_IMAGE_TAG`. Use a release tag, never an `-rc` one: the pre-release rc4 **1-Click image** never served HTTPS (#2862, fixed in v0.9.5). Override the tag with `TRINITY_IMAGE_TAG=… bash <(…)`. The script on `dev` currently defaults to `v1.0.0-aws.2`, a throwaway pre-release cut for the AWS image build: fine for a trial, not for a droplet you intend to keep.
+`<tag>` is the release you want, e.g. `v1.0.0`, and the script deploys that same tag as its default `TRINITY_IMAGE_TAG`. Use a release tag, never an `-rc` one: the pre-release rc4 **1-Click image** never served HTTPS (#2862, fixed in v0.9.5). Override the tag with `TRINITY_IMAGE_TAG=… bash <(…)`. At `v1.0.0` the script's default tag is `v1.0.0`. The live DigitalOcean 1-Click listing (`marketplace.digitalocean.com/apps/trinity`) is the other route; it lets you pick a plan below the 4 GB / 2 vCPU minimum (#3009), so choose at least that size.
 
 Prompts, in order:
 1. Password, then the same password again. Secrets are read with `read -rs`, so they are not echoed and stay out of shell history.

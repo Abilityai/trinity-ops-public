@@ -119,7 +119,7 @@ DATA_MOUNT=${DATA_MOUNT:-trinity_trinity-data}
 
 Abort (and restart the services with step 9's `up -d`) if `quick_check` prints anything but `ok`.
 
-**PostgreSQL instances** skip 8b/8c. Check the backend first: `./scripts/run.sh "sudo docker exec trinity-backend printenv DATABASE_URL"` (a hosted install on post-0.9.5 dev runs the bundled `trinity-postgres` unless it predates #3159). With the writers stopped (8a):
+**PostgreSQL instances** skip 8b/8c. Check the backend first: `./scripts/run.sh "sudo docker exec trinity-backend printenv DATABASE_URL"` (a hosted install on v1.0.0 runs the bundled `trinity-postgres` unless it predates #3159). With the writers stopped (8a):
 
 ```bash
 # Bundled trinity-postgres. Which pg_restore can read a dump depends on the client that wrote it:
@@ -155,9 +155,9 @@ If the base image is also rolled back, check `git fetch` on a couple of agents a
 
 **Hosted installs** (`docker-compose.hosted.yml`, #2280): skip the build above. Set `TRINITY_IMAGE_TAG` in the server `.env` to the previous release tag (`v0.9.5`, `0.9.5`, or the exact `sha-<short>`), check out the matching tag in step 7 (`git fetch --tags && git checkout <tag>` rather than a reset to a branch commit) so the compose file and the bind-mounted `config/` match the images, and re-run `start.sh --hosted`, which also pulls that release's agent base image.
 
-**Rolling a hosted install back across #3159 (bundled PostgreSQL, post-0.9.5 dev).** The older `docker-compose.hosted.yml` has no `postgres` service and reads `${DATABASE_URL:-}`. An install that stayed on SQLite (`DATABASE_URL=` empty) rolls back cleanly. An install that is **on the bundled PostgreSQL cannot roll back to a pre-#3159 tag**: the old stack would start without the database server and the backend would fail to connect. Its data stays in the `trinity_postgres-data` volume; roll forward again, or run the server by hand first. Never delete the `DATABASE_URL` line while on the newer compose file: absent means bundled PostgreSQL there.
+**Rolling a hosted install back across #3159 (bundled PostgreSQL, v1.0.0).** The older `docker-compose.hosted.yml` has no `postgres` service and reads `${DATABASE_URL:-}`. An install that stayed on SQLite (`DATABASE_URL=` empty) rolls back cleanly. An install that is **on the bundled PostgreSQL cannot roll back to a pre-#3159 tag**: the old stack would start without the database server and the backend would fail to connect. Its data stays in the `trinity_postgres-data` volume; roll forward again, or run the server by hand first. Never delete the `DATABASE_URL` line while on the newer compose file: absent means bundled PostgreSQL there.
 
-**Rolling back across the post-0.9.5 dev migrations.** Alembic `0085` cleared duplicate sign-in emails and `0089`/`0090` cancelled superseded operator-queue rows; neither downgrade restores them, so use the pre-update database if those matter. Capability grants (`agent_capability_grants`) are ignored by older code, which lets agent keys reshape agents again.
+**Rolling back across the v1.0.0 migrations.** Alembic `0085` cleared duplicate sign-in emails and `0089`/`0090` cancelled superseded operator-queue rows; neither downgrade restores them, so use the pre-update database if those matter. Capability grants (`agent_capability_grants`) are ignored by older code, which lets agent keys reshape agents again. `0097`–`0100` are additive or data-only: `0098` turned every `agent_sharing.allow_proactive = 0` into NULL ("never asked"; both mean no proactive messages to older code) and `0100` cleared a PostgreSQL admin's `email = username` — neither matters for a rollback. Rolling back **below v1.0.0** also re-opens what 1.0 closed: `user`-role accounts regain the operator UI (ent#837), peer skill grants (`agent_peer_skill_grants`) are ignored, so edges expose library skills again (ent#662), agent keys regain owner-wide reach on fleet routes (ent#872), and the Files routes drop the per-verb tiers. Tell the user before rolling back across it.
 
 ### 10. Verify Health
 

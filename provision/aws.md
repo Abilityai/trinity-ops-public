@@ -11,17 +11,17 @@ aws configure                        # Enter Access Key ID + Secret
 aws sts get-caller-identity          # Verify auth
 ```
 
-## One-command install (after v0.9.5, #3004)
+## One-command install (v1.0.0, #3004)
 
-Upstream's `start.sh --provision --cloud aws` installs Docker, Caddy with an HTTPS certificate for the instance's public IP, a host firewall, and Trinity from prebuilt images on the bundled PostgreSQL. **v0.9.5 and earlier reject `--cloud aws`**, so this needs a later release tag. Upstream's guide on the server: `docs/user-docs/guides/deploying/aws.md`.
+Upstream's `start.sh --provision --cloud aws` installs Docker, Caddy with an HTTPS certificate for the instance's public IP, a host firewall, and Trinity from prebuilt images on the bundled PostgreSQL. **v0.9.5 and earlier reject `--cloud aws`**; use `v1.0.0` or later. Upstream's guide on the server: `docs/user-docs/guides/deploying/aws.md`.
 
 Three routes run the same installer:
 
 | Route | Status |
 |-------|--------|
 | Script install on your own instance | Available (this section) |
-| CloudFormation stack, `packer/aws/trinity.cfn.yaml` | Template is in the repo; the public Trinity AMI it launches is not published yet |
-| AWS Marketplace AMI | Listing pending |
+| CloudFormation stack, `packer/aws/trinity.cfn.yaml` | Template is in the repo; the one-click Launch Stack link is not published yet. Pass the AMI ID from your Marketplace subscription as `ImageId` |
+| AWS Marketplace AMI | **Live** since v1.0.0: `https://aws.amazon.com/marketplace/pp/prodview-q6f3biwa662o2` (`t3a.large` and up; Docker, Caddy, Redis and PostgreSQL baked in; always the instance-ID claim; install source `aws-marketplace`, which also shows the "Secure this instance" card) |
 
 ### Before you run it
 

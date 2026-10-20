@@ -38,7 +38,7 @@ case "$COMPOSE" in *hosted*) echo "MODE: hosted (prebuilt GHCR images, #2280)";;
 
 A hosted upgrade is three moves, in this order: set the new `TRINITY_IMAGE_TAG` in the server `.env` (the last line wins), **check out the matching git tag**, run `start.sh --hosted`. The checkout matters because the compose file and the bind-mounted `config/` have to match the images, and a marketplace or one-command install is a `--depth 1 --branch <tag>` clone with a detached HEAD, on which `git pull` is not an upgrade. Ask the user which release tag they want and set it before continuing; `scripts/update.sh` then does the checkout and the start.
 
-### 2a. Hosted database selector (post-0.9.5 dev, #3159)
+### 2a. Hosted database selector (v1.0.0, #3159)
 
 Only when the target release bundles PostgreSQL in `docker-compose.hosted.yml`. Record what the instance runs **before** the upgrade, so the result can be compared afterwards:
 
@@ -58,6 +58,17 @@ An install on SQLite stays on SQLite: `start.sh --hosted` writes an empty `DATAB
 ```
 
 `0` ⇒ **stop**. The 0.9.5 secret-settings migration (#2330) encrypts six credential rows in `system_settings` at first boot and the backend refuses to start without the key when such rows exist. Set it (`openssl rand -hex 32`) and only then continue. Note for the summary: after this upgrade the operator must **rotate every credential that was entered via Settings** — old backups still hold plaintext.
+
+### 2c. Workspace-only `user` role (v1.0.0, ent#837) — only when the target is v1.0.0 or later
+
+Platform role `user` becomes **Workspace-only**: every operator route, MCP key and `/ws/events` answers 403 `workspace_only` for it, and no migration promotes anyone. List the accounts first (admin token from `POST /token`; works on both database backends):
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api/users \
+  | jq -r '.[] | select(.role=="user") | [.username, .email, .last_login] | @tsv'
+```
+
+If any of them operate agents, **stop and ask the user** which to raise before continuing. Raising is `PUT /api/users/{username}/role {"role":"operator"}` from an admin **JWT session** (keys refused) or Settings → Access. Runbook on the server after the pull: `docs/migrations/WORKSPACE_ONLY_USER_ROLE_2026-10.md`.
 
 ### 3. Check Running Executions
 
@@ -172,7 +183,9 @@ Adoption rules (v0.9.0, #1809 / #1860 / #1816): a **cold stop → start** of an 
 
 **Crossing 0.9.0 → 0.9.5 the rebuild + wave is not optional** — arm64 native binary (#2537), guardrail hooks in `/etc/claude-code/managed-settings.json` (ent#345), pre-installed Trinity plugin (ent#411), Codex `auth.json` (#2333), wedge diagnostics (#2503), the 11-tool deny list (#2476), the sanitizer ReDoS fix (#2398), parked-call tracking (#2435), the `git-credential-trinity` helper (ent#615), the lock-free `git status` read (#2742) and the comma-separated `allowed-tools` parse (#2850) all ship in the image. Hosted installs got the new base image from `start.sh --hosted` in step 8; the wave is still needed.
 
-**Crossing 0.9.5 → post-0.9.5 dev it is not optional either.** Image-side: Claude Code pinned to `2.1.281` (#3013; `claude-opus-5-5` needs ≥ 2.1.280), `gemini-cli@0.62.0` (#2971; every Gemini turn failed on the unpinned image), pinned agent-server dependencies (#3106; an OTEL-enabled agent's server died at boot while the container stayed Up), the in-container pull loop and live auto-sync gate (ent#703, #3010, #3011), the `.claude/settings.json` content guard (ent#708), retained results (#2947), exec-form guardrail hooks and the skill-gate hook (ent#787, ent#752), and the agent `/health` guardrail fields (#3113). After the wave also check `docker exec agent-x curl -s localhost:8000/health | jq '.guardrails_registration, .skill_gate_hook'` (both `ok`) and `docker exec agent-x claude --version`.
+**Crossing 0.9.5 → v1.0.0 it is not optional either.** Image-side: Claude Code pinned to `2.1.281` (#3013; `claude-opus-5-5` needs ≥ 2.1.280), `gemini-cli@0.62.0` (#2971; every Gemini turn failed on the unpinned image), pinned agent-server dependencies (#3106; an OTEL-enabled agent's server died at boot while the container stayed Up), the in-container pull loop and live auto-sync gate (ent#703, #3010, #3011), the `.claude/settings.json` content guard (ent#708), retained results (#2947), exec-form guardrail hooks and the skill-gate hook (ent#787, ent#752), and the agent `/health` guardrail fields (#3113). After the wave also check `docker exec agent-x curl -s localhost:8000/health | jq '.guardrails_registration, .skill_gate_hook'` (both `ok`) and `docker exec agent-x claude --version`.
+
+**Rebuilt on an `-aws.N` / `-rc` image already?** Rebuild once more for 1.0: the `.env` seed that overwrote injected credentials on every restart (#3710), the files tier policy (ent#820 / ent#823 — until recreated, non-owners get 403 `agent_restart_required` on reads), the per-spawn SUB-003 credential (#3470), concurrent tool-id cross-wiring (#3712) and real API error text (#3340). Pins are unchanged (Claude Code `2.1.281`, `gemini-cli@0.62.0`, `@openai/codex@0.147.0`). Until an agent is recreated the Skills tab shows a gated skill as "not enforced".
 
 After the wave:
 
@@ -213,7 +226,7 @@ Also mention for 0.9.5:
 - Users must re-login and reconnect MCP clients.
 - The first headroom sweep may file critical `_sub-headroom` items for over-limit subscriptions (#2419).
 
-### 8e. Post-0.9.5 dev checks (only when the target is past v0.9.5)
+### 8e. v1.0.0 checks (only when the target is past v0.9.5)
 
 After step 11, read the boot log once and report what it says:
 
@@ -230,6 +243,15 @@ Tell the user:
 - **MCP keys can only be created or listed from a signed-in session**, and only a person can answer or cancel operator-queue items. Automation that did either with a key needs a rethink.
 - **Git sync**: the container now pulls origin wherever auto-sync was on, and a work agent diverged from origin for more than 24h freezes its schedules (when the freeze flag is on). The clocks start at the first poll after the upgrade.
 - Platform alerts in the operator queue collapse to one row per condition at boot, so the queue may look much shorter. That is expected.
+- **Peer skill grants** (ent#662, Alembic `0099`): an agent calling another agent's *library* skill now needs a per-skill grant. Read the drift list and offer to grant the legitimate pairs (admin JWT):
+  ```bash
+  curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api/skills/peer-grants/drift | jq
+  # grant: PUT /api/agents/{caller}/peer-skills/{target}/{skill}  (no body)
+  ```
+- **Agent-key reach narrowed** (ent#629 / ent#872): orchestrator keys see only themselves, their edge targets and their spawn, fleet routes included. 404s or empty lists for siblings mean a missing edge.
+- **Inbound A2A needs a credential** (ent#885): any caller that relied on the `-aws.N` keyless trusted-network path must get a key; the trusted list now governs outbound only.
+- **Enterprise instances**: bump the submodule pin to `982735f`.
+- Re-login and reconnect MCP clients.
 
 ### 9. Restart Services (source build only)
 
@@ -308,7 +330,7 @@ Write to `$DEPLOY_FILE`:
 | Restart-policy sweep | {n agents moved to unless-stopped / already done} |
 | Secret-settings migration | {not applicable / ran — ROTATE Settings-entered credentials / REFUSED (key missing)} |
 | Database | {sqlite / postgresql — same as before the upgrade? yes / NO} |
-| Post-0.9.5 notices | {not applicable / ent#720 cleared n emails / capability grants needed for: … / none} |
+| 1.0 notices | {not applicable / `user` accounts raised: … / ent#720 cleared n emails / capability grants needed for: … / peer-skill drift: n pairs / none} |
 | INTERNAL_API_SECRET | {OK / CRITICAL} |
 | Tunnel | {restarted / not present} |
 

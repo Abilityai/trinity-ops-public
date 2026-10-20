@@ -1,6 +1,6 @@
 # Provision Trinity on Vultr
 
-Vultr support arrived after v0.9.5 (#2282 / #3224). `start.sh --provision --cloud vultr` is rejected by v0.9.5 and earlier, so everything here needs a later release tag.
+Vultr support shipped in v1.0.0 (#2282 / #3224). `start.sh --provision --cloud vultr` is rejected by v0.9.5 and earlier, so use `v1.0.0` or later.
 
 There are two ways in, and both run the same installer and end on the same hosted stack: `/opt/trinity`, prebuilt GHCR images, Caddy serving HTTPS on the server's IP, bundled PostgreSQL.
 
@@ -42,7 +42,7 @@ After signing in as `admin`, finish the **Connect Claude** step: paste a subscri
 
 ## Marketplace app (imageless)
 
-Vultr runs `scripts/deploy/vultr-vendor-data.sh` once, as root, on a clean Ubuntu 24.04 at first boot. There is no snapshot. The same file works as plain **User Data** on any Vultr instance, which is how to try it before the listing exists; it still records `vultr-marketplace`, so use a throwaway instance.
+Vultr runs `scripts/deploy/vultr-vendor-data.sh` once, as root, on a clean Ubuntu 24.04 at first boot. There is no snapshot. The same file works as plain **User Data** on any Vultr instance, which is also how to run it outside the listing; it still records `vultr-marketplace`, so use a throwaway instance.
 
 The script:
 
@@ -55,7 +55,7 @@ First boot takes about 4 minutes (apt plus a ~1.6 GB image pull).
 
 **Open `https://<ip>` as soon as it is up.** The first person to open it creates the admin account, and until someone does, anyone who finds the address can. A never-opened instance that shows a login page instead of the create-admin form was claimed by someone else: destroy it and start again.
 
-**Until a stable release contains `--cloud vultr`, this path cannot complete**: `releases/latest` is v0.9.5, whose `start.sh` rejects the flag.
+Since v1.0.0 (2026-10-20) `releases/latest` resolves to a release whose `start.sh` accepts `--cloud vultr`, so this path completes. Before that it could not: v0.9.5 rejects the flag.
 
 ## If first boot fails
 
