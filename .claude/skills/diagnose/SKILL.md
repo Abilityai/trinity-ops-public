@@ -64,9 +64,28 @@ source .env
 ./scripts/run.sh "sudo docker logs trinity-backend --tail 3000 2>&1 | grep 'ent#615: remote-token sweep' | grep -E \"'refused': [1-9]|'gitmodules_hits': [1-9]|'root_readable': 0\" | tail -5; true"
 # #2742 / #2800: sync-health poller errors (PG `integer out of range` = pre-0063 schema)
 ./scripts/run.sh "sudo docker logs trinity-backend --since 24h 2>&1 | grep -iE 'sync.?health.*(error|failed)|integer out of range' | tail -5; true"
+# v1.0.0 (#3113 / ent#752): the agent server's own /health reports the guardrail and
+# skill-gate registration (the Skills tab reads skill_gate_hook since v1.0.0: "not enforced").
+# A null means an old image.
+./scripts/run.sh "for c in \$(sudo docker ps --format '{{.Names}}' | grep '^agent-'); do echo \"\$c \$(sudo docker exec \$c curl -s -m 5 localhost:8000/health 2>/dev/null | jq -c '[.guardrails_registration, .skill_gate_hook]' 2>/dev/null)\"; done"
+# v1.0.0: image pins (Opus 5.5 needs Claude Code >= 2.1.280), pull loop, retained results
+./scripts/run.sh "for c in \$(sudo docker ps --format '{{.Names}}' | grep '^agent-' | head -5); do echo \"\$c \$(sudo docker exec \$c claude --version 2>/dev/null | head -1) pull_loop=\$(sudo docker logs \$c 2>&1 | grep -c 'pull loop started')\"; done"
+# v1.0.0: upgrade-time notices worth reading once (cleared sign-in emails, capped CPU,
+# unlabelled orphan volumes, refused agent self-changes, chain-depth refusals)
+./scripts/run.sh "sudo docker logs trinity-backend --since 24h 2>&1 | grep -E 'ent#720|\[#2318\]|\[#3214\]|capability_refused|inter_agent_depth_exceeded|effect_unguarded' | tail -10; true"
+# v1.0.0: SUB-003 walking subscriptions (#3470 — 'image predates it' = old agent image),
+# completed_at clamps (#3589)
+./scripts/run.sh "sudo docker logs trinity-backend --since 24h 2>&1 | grep -E '\[#3470\]|\[#3589\]' | tail -10; true"
 ```
 
-Flag: any `no` policy, any `GUARDRAILS: ERROR`, any diagnostics events, a non-trivial parked/recovered count, any agent whose remote still carries a credential, or any sweep report with `refused` > 0, `gitmodules_hits` > 0 (**rotate the platform token**) or `root_readable` 0.
+v1.0.0 access checks (admin token): peer-skill calls refused since the upgrade, and `user`-role accounts that now get 403 `workspace_only` on operator routes:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api/skills/peer-grants/drift | jq
+curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api/users | jq -r '.[] | select(.role=="user") | .username'
+```
+
+Flag: any `guardrails_registration` or `skill_gate_hook` other than `ok` (a `null` pair means the agent is still on a pre-pin base image), any `ent#720 duplicate sign-in email` line (that account lost email sign-in), repeated `capability_refused` (an orchestrator agent needs a grant — CLAUDE.md → Self-change grants), any `no` policy, any `GUARDRAILS: ERROR`, any `did not apply the per-spawn credential` (#3470, old image), a non-empty peer-skill drift list (grant or accept the refusals — CLAUDE.md → Peer skill grants), a `user` account that operates agents (raise it to `operator`), any diagnostics events, a non-trivial parked/recovered count, any agent whose remote still carries a credential, or any sweep report with `refused` > 0, `gitmodules_hits` > 0 (**rotate the platform token**) or `root_readable` 0.
 
 ### 6. Disk Space
 
@@ -91,9 +110,20 @@ source .env
 
 ### 9. Database Integrity
 
+Backend-aware, and read through the backend's own `/data` mount so it is right for the dev named volume and for a prod or hosted bind mount alike. A hosted install on v1.0.0 runs the bundled PostgreSQL unless it predates #3159.
+
 ```bash
 source .env
-./scripts/run.sh "sudo docker run --rm -v trinity_trinity-data:/data alpine sh -c 'apk add --quiet sqlite && sqlite3 /data/trinity.db \"PRAGMA integrity_check\"'"
+DB_URL=$(./scripts/run.sh "sudo docker exec trinity-backend printenv DATABASE_URL 2>/dev/null" 2>/dev/null | tr -d '[:space:]' || true)
+if [[ "$DB_URL" == postgresql://* ]]; then
+    # One head expected; two means migrations are silently not applying
+    ./scripts/run.sh "sudo docker exec trinity-backend alembic heads"
+    ./scripts/run.sh "sudo docker ps --format '{{.Names}}' | grep -qx trinity-postgres && sudo docker exec trinity-postgres pg_isready -h 127.0.0.1 -U trinity -d trinity || echo 'external PostgreSQL — check it with your provider tooling'"
+else
+    ./scripts/run.sh "sudo docker exec trinity-backend python3 -c \"import sqlite3; c=sqlite3.connect('file:/data/trinity.db?mode=ro',uri=True); print(c.execute('PRAGMA integrity_check').fetchone()[0])\""
+    # Hosted on SQLite after #3159: the selector must be an EMPTY line, never absent
+    ./scripts/run.sh "grep -q 'container_name: trinity-postgres' ${TRINITY_PATH:-~/trinity}/${COMPOSE_FILE:-docker-compose.prod.yml} && (grep -qE '^DATABASE_URL=' ${TRINITY_PATH:-~/trinity}/.env && echo 'hosted selector ok' || echo 'WARNING: hosted compose bundles PostgreSQL and .env has no DATABASE_URL line — the next compose up boots an EMPTY PostgreSQL'); true"
+fi
 ```
 
 ### 9b. Silent Maintenance-Job Failures (v0.9.0+)
@@ -146,7 +176,7 @@ source .env
 
 **Maintenance jobs**: backups {ok/failed/stale/disabled, last success}, archives {writable/NOT}, retention {blocked sweeps}
 
-**Agent runtime (v0.9.5)**: restart policy {n agents still `no`}, guardrails {verified / n ERROR}, wedge diagnostics {n events}, parked calls {n}, git remotes {clean / n with credential; sweep refused/gitmodules/unreadable}, sync-health {ok / errors}
+**Agent runtime (v0.9.5+)**: restart policy {n agents still `no`}, guardrails {verified / n ERROR; /health registration ok / n not ok / n old image}, wedge diagnostics {n events}, parked calls {n}, git remotes {clean / n with credential; sweep refused/gitmodules/unreadable}, sync-health {ok / errors}
 
 ### Recommendations
 {Specific next steps based on findings}

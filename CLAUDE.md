@@ -108,6 +108,27 @@ Pulls the latest code, rebuilds Docker images, restarts services, and verifies h
 11. **`WORKSPACE_ENABLED` is retired** (#2836) — removed from all compose files and read by nothing; delete it from `.env`.
 12. **Re-login and reconnect MCP clients** after the upgrade — sessions rotate on backend restart. The first headroom sweep after upgrading may raise critical `_sub-headroom` items for every subscription that is over its limit: readings above 100% used to parse as ~1% (#2419). History rows written before the fix cannot be repaired.
 
+**v1.0.0 upgrade notes (0.9.5 → 1.0.0, released 2026-10-20):** `v1.0.0` is on `main`, published to GHCR and is `latest`. Release doc on the server: `docs/releases/1.0.0.md` (the "Behavior changes / upgrade notes" section); user summary `docs/user-docs/whats-new/v1.0.0.md`. The throwaway `1.0.0-aws.N` and `-rcN` pre-releases are superseded; move any instance pinned to one onto `v1.0.0`. Enterprise instances: bump the submodule pin to `982735f`.
+
+0. **Before upgrading: raise operators off the `user` role** (ent#837). Platform role `user` now means **Workspace-only**: every operator route (REST, MCP, `/ws/events`) answers 403 `{"code":"workspace_only"}`, and its MCP keys work only on the Workspace API. No migration promotes anyone. List: `SELECT username,email,last_login FROM users WHERE role='user'`; raise with Settings → Access or `PUT /api/users/{username}/role {"role":"operator"}` (admin **JWT session**; every key refused; audited `role_change`). With SSO, set the provider's default role to `operator` if new sign-ins are operators. Sharing an agent or approving an access request no longer writes a login-whitelist row — give a platform account from the Email Whitelist (role picker, default `user`). A lowered role bites on reconnect; restart the backend to force it. Runbook: `docs/migrations/WORKSPACE_ONLY_USER_ROLE_2026-10.md`.
+1. **Hosted installs bundle PostgreSQL** (#3159). `docker-compose.hosted.yml` gains a `trinity-postgres` service and needs `POSTGRES_PASSWORD` to render at all; `start.sh --hosted` generates it. An install that already has `trinity-data/trinity.db` **stays on SQLite**: `start.sh` writes `DATABASE_URL=` (empty) and an idle `trinity-postgres` starts beside it. Nothing is migrated. Run `start.sh --hosted` once before any bare `docker compose -f docker-compose.hosted.yml …`. See [Database Backend](#database-backend-sqlite-default--postgresql-300).
+2. **PostgreSQL: `pg_trgm` must be creatable.** Alembic `0064` runs `CREATE EXTENSION IF NOT EXISTS pg_trgm` and **fails the boot** if it cannot. On a managed PostgreSQL whose deploy role lacks that privilege, have an admin create the extension before upgrading. The range is `0064` → `0100` on one head (the only merge is still `0045`).
+3. **Sign-in emails become unique** (ent#720, Alembic `0085`). Per `lower(email)` the earliest-created account keeps the address; the others are cleared and lose email sign-in until they re-bind. After the upgrade: `docker logs trinity-backend 2>&1 | grep 'ent#720'`.
+4. **Grant your orchestrator agents** (ent#164 / ent#596, Alembic `0072`). An agent key now needs a capability grant to change skills, another agent's schedules, instructions, or to create/delete/reconfigure agents. No agent holds any grant after the upgrade, so automation that did these things with an agent key gets 403 `…_not_permitted`. Grant with an admin **JWT**: see [Self-change grants](#self-change-grants-and-person-only-routes-v100-ent164--ent596--2996).
+5. **Machine paths narrowed.** Creating and listing MCP keys needs a signed-in JWT session, for every scope (#3043 / #3045). Operator-queue `respond`, `cancel` and `bulk-cancel` are person-only (ent#611). `PUT /api/agents/{name}/{api-key-setting,autonomy,capabilities,capacity}` are person-only, and the `system` key is refused there too (#2996). This agent's `POST /token` flow is unaffected.
+6. **Rebuild the agent base image and cold-recreate every agent.** Image-side in this range: Claude Code pinned to `2.1.281` (#3013; `claude-opus-5-5` needs ≥ 2.1.280, and the old `@latest` install was layer-cached), `gemini-cli@0.62.0` (#2971; every Gemini turn failed at argument parsing on the unpinned image), pinned agent-server dependencies (#3106; FastAPI 0.142 killed the agent server on OTEL-enabled agents while the container stayed Up), the in-container pull loop and live auto-sync gate (ent#703, #3010, #3011), the `.claude/settings.json` content guard (ent#708), retained results (#2947), `is_error` chat results (#3153), own-session resume (#2958), sanitizer fixes (#3311 / #3312), exec-form guardrail hooks and the sudo deny patterns (ent#787, #3113), the skill-gate hook (ent#752), and the agent `/health` guardrail fields. The build now fails on its own smoke tests instead of shipping a broken image.
+7. **Operator queue is reshaped at boot.** Alembic `0089` cancels all but the newest flood-alert row per agent, `0090` collapses platform alerts to one pending row per subject, and `0093` heals rows stuck in `responded`. The `~/.trinity/operator-queue.json` file channel is deprecated in favour of the `ask_operator` MCP tool ("kept for two releases").
+8. **Git sync.** Alembic `0087` turns the new container-side pull on wherever `auto_sync_enabled=1`. The divergence clocks (`0082`) start at the first post-upgrade poll, so the new 24h-divergence freeze cannot fire for a day. See [Scheduled runs silently skipped](#scheduled-runs-silently-skipped-while-git-sync-is-failing).
+9. **Hosted upgrades need the checkout moved too**: pin `TRINITY_IMAGE_TAG` in `.env` **and** `git fetch --tags && git checkout <tag>`, then `start.sh --hosted`, so the compose file and the mounted `config/` match the images. `scripts/update.sh` does this.
+10. **Orphan agent volumes** (#3214 / #3231). Agent volumes are now labelled `trinity.instance=<installation_id>` and the #1581 sweep reclaims only its own. Unlabelled pre-upgrade orphans are never reclaimed, only named in a WARNING (`[#3214] N unlabelled agent volume(s) with no owner`); delete them by hand.
+11. The bundled skills pin moves to `trinity-skills v0.5.0` (#3123 / #3430; v0.3.0 dropped `add-backlog`, `add-project-management`, `add-canon`, `add-orchestrator`; v0.4.0/v0.5.0 add `project-status` and `update-status`), fresh installs only. `ADMIN_USERNAME` other than `admin` now gets its system agent and starter fleet (#3262); it never did before.
+12. **Peer skill grants** (ent#662, Alembic `0099`). An `agent_permissions` edge now exposes only the skills the target **declares itself**; a library-assigned skill on another agent needs a per-skill grant, and nobody holds one after the upgrade. A peer call without it gets 403 `skill_not_granted` (audited `peer_skill_refused`; 503 `peer_surface_unavailable` when the check cannot read its data — fails closed). **Right after upgrading** read `GET /api/skills/peer-grants/drift` (Settings → Agents: the last 30 days of calls that are now refused, each with a Grant button) and grant the legitimate pairs. See [Peer skill grants](#peer-skill-grants-and-agent-key-reach-v100-ent662--ent629--ent872).
+13. **Agent keys reach less** (ent#629 / ent#872). An agent key reaches itself, its edge targets and the agents it spawned — on fleet routes too (executions, notifications, activities, systems, tags, event subscriptions, slots, telemetry, subscriptions, operator queue). An orchestrator that read siblings with its own key now sees 404 or an empty list: add an edge, or move the automation to a `user` key.
+14. **Every inbound A2A call needs a credential** (ent#885). The keyless trusted-network path that shipped on the `-aws.N` pre-release is gone; `a2a_scope` / `a2a_keyless_internal` are inert. `PUT /api/settings/a2a-trusted-networks` now only allowlists private / plain-HTTP **outbound** endpoints. Keyless tailnet callers must be given a key. The per-agent outbound A2A endpoint form is retired (ent#898): endpoints registered there were never callable — re-register them under Settings → Integrations (`PUT /api/settings/a2a-endpoints`).
+15. **Files are tiered per verb** (ent#819 / ent#820 / ent#823). Reading credential-class files (`.env*`, `.mcp.json*`, `.ssh`, `.git/config`, `*.pem`, cloud CLI configs, …) needs the owner or an admin as a person (403 `owner_tier_path`); share holders can no longer write instructions, `.claude/**` or shell/git init files, nor see hidden files. Runtime configs (`~/.claude.json`, `.claude/.credentials.json`, `.gemini/settings.json`, `.tmp/codex/*`) are write-denied for everyone. Until an agent runs the 1.0 image, non-owners get 403 `agent_restart_required` on reads.
+16. **Rebuild the base image again** if you last rebuilt on an `-aws.N`/`-rc` build. Image-side in the final stretch: the `.env` seed no longer overwrites injected credentials on restart (#3710), the never-working startup `.credentials.enc` auto-import is gone (the backend imports it once the agent is ready, #3510), the files tier policy above, per-spawn credential override for SUB-003 (#3470), concurrent tool-id cross-wiring (#3712), real API error text instead of the OOM guess (#3340). Pins unchanged: Claude Code `2.1.281`, `gemini-cli@0.62.0`, `@openai/codex@0.147.0`. Until an agent is recreated, the Skills tab shows a gated skill as **"not enforced"** (it reads the agent `/health` `skill_gate_hook`; `predates` = old image) and operator-queue write protection (#2915 CAS write-back) is absent.
+17. Smaller: `0097` lets an agent replace one of its own pending asks and `withdraw_ask` ends one (ent#901); pending asks sort **oldest first** (#3679); an expired non-gate approval ends with `disposition_reason='outcome_unknown'` (ent#844). `0098` makes `agent_sharing.allow_proactive` tri-state (NULL = never asked, existing 0s become NULL; only 1 allows messaging). `0100` clears a PostgreSQL admin's `email = username` so the first-run "Sign-in email" step appears (#3554). Renamed agents need one **cold** stop/start to re-bake `AGENT_NAME` (#3813). Delegated work reports back into the asking Slack/Telegram/Workspace conversation (`MCP_REPORT_BACK_ENABLED=false` to stop); Telegram group context is on for existing groups (per-group off switch).
+
 ### Backup Database
 
 **Trinity backs up its own database since v0.9.0 (#2216)** — nightly at **03:30 UTC**, both backends, default ON, zero setup:
@@ -141,7 +162,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api
 
 `backup.sh` uses the SQLite online-backup API — **never `cp` a live `trinity.db`** (a raw copy mid-write, ignoring its journal, can be torn or stale). On a **managed/external PostgreSQL** (`DATABASE_URL` pointing off-box) use your provider's snapshot tooling or `pg_dump -Fc` against the host.
 
-Also back up **`~/trinity/.env` manually** — it holds `CREDENTIAL_ENCRYPTION_KEY`; a database artifact alone does not cover it.
+Also back up **`~/trinity/.env` manually** — it holds `CREDENTIAL_ENCRYPTION_KEY`; a database artifact alone does not cover it. On a hosted install with the bundled PostgreSQL (#3159) it also holds `POSTGRES_PASSWORD`, the only password that opens the existing `trinity_postgres-data` volume, and the live data is in that volume rather than in the data directory.
 
 **Restore (SQLite)** — stop **both** DB writers, remove stale journal sidecars, copy the artifact in, start:
 
@@ -152,7 +173,18 @@ Also back up **`~/trinity/.env` manually** — it holds `CREDENTIAL_ENCRYPTION_K
 ./scripts/run.sh "cd ${TRINITY_PATH:-~/trinity} && sudo docker compose -f ${COMPOSE_FILE:-docker-compose.prod.yml} start backend scheduler"
 ```
 
-`/rollback [commit] [backup]` runs this sequence for you. **PostgreSQL:** `pg_restore` the `.dump` into an empty database with backend+scheduler stopped, then point `DATABASE_URL` at it.
+`/rollback [commit] [backup]` runs this sequence for you. **External PostgreSQL:** `pg_restore` the `.dump` into an empty database with backend+scheduler stopped, then point `DATABASE_URL` at it.
+
+**Restore (bundled PostgreSQL, hosted or dev profile)** — the client that wrote the dump decides which `pg_restore` can read it. A nightly `trinity-backup-*.dump` comes from the backend image's v17 client, and the server-16 `pg_restore` inside `trinity-postgres` rejects that archive version, so restore it with the backend image. A `scripts/backup.sh` dump was written inside `trinity-postgres` and restores there. Not exercised on a live instance yet; take a fresh `backup.sh` dump first.
+
+```bash
+./scripts/run.sh "cd ${TRINITY_PATH:-~/trinity} && sudo docker compose -f ${COMPOSE_FILE:-docker-compose.prod.yml} stop backend scheduler"
+# nightly artifact (already under /data/backups in the backend's data mount)
+./scripts/run.sh "cd ${TRINITY_PATH:-~/trinity} && sudo docker compose -f ${COMPOSE_FILE:-docker-compose.prod.yml} run --rm --no-deps --entrypoint sh backend -c 'pg_restore --clean --if-exists --no-owner -d \"\$DATABASE_URL\" /data/backups/<artifact>.dump'"
+# backup.sh artifact (~/backups on the host)
+./scripts/run.sh "sudo docker exec -i trinity-postgres pg_restore -U trinity -d trinity --clean --if-exists --no-owner < ~/backups/<artifact>.dump"
+./scripts/run.sh "cd ${TRINITY_PATH:-~/trinity} && sudo docker compose -f ${COMPOSE_FILE:-docker-compose.prod.yml} start backend scheduler"
+```
 
 ### Tunnel (remote only)
 
@@ -192,14 +224,14 @@ source .env
 
 **Stopped stays stopped (v0.9.5, #2541).** Agent containers are `restart: unless-stopped`, so they come back after a host reboot or a dockerd restart — *unless* they were stopped deliberately. Both `docker stop` and Trinity's own stop set Docker's manual-stop flag, which `unless-stopped` honours across reboots. Caveat: the flag is set only when the stop *succeeds* — after `POST /api/ops/emergency-stop`, any agent reported as `{"result":"error"}` is still running and will now survive the next reboot; re-issue for it. `always` is deliberately unreachable.
 
-File sharing is disabled per agent by default. Enable it via the Sharing panel in AgentDetail UI, or via API:
+File sharing is disabled per agent by default. Enable it via the Sharing panel in AgentDetail UI, or via API. The response carries `restart_required`; the volume is attached on the agent's next stop/start.
 
 ```bash
-# Enable file sharing for an agent
-curl -s -X PATCH http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent \
+# Enable file sharing for an agent (there is no PATCH /api/agents/{name} route)
+curl -s -X PUT http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/file-sharing \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"file_sharing_enabled": true}'
+  -d '{"enabled": true}'
 ```
 
 ---
@@ -219,24 +251,27 @@ share_file — publishes a file and returns a download URL (7-day default expiry
 source .env
 HOST=${SSH_HOST:-localhost}
 
-# Enable file sharing for an agent (also available in AgentDetail > Sharing panel)
-curl -s -X PATCH http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent \
+# Enable file sharing for an agent (also available in AgentDetail > Sharing panel);
+# takes effect on the next stop/start (`restart_required` in the response)
+curl -s -X PUT http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/file-sharing \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"file_sharing_enabled": true}'
+  -d '{"enabled": true}'
 
-# List all shared files for an agent
+# List all shared files for an agent (…/files is the WORKSPACE listing, not the shares)
 curl -s -H "Authorization: Bearer $TOKEN" \
-  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/files | jq
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/shared-files | jq
 
-# Revoke a shared file
+# Revoke a shared file (204; /api/files/<id> is the public GET download only)
 curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
-  http://$HOST:${BACKEND_PORT:-8000}/api/files/<file_id> | jq
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/shared-files/<file_id>
 ```
 
 Download URLs follow the form: `http://<host>:<BACKEND_PORT>/api/files/<id>?token=<download_token>`
 
 Files expire after 7 days. One-time files are consumed on first download.
+
+Since v1.0.0 (ent#549, Alembic `0068`) a shared file is addressed to the person the turn was for (`addressed_to_email`, `addressed_to_channel`, `audience_source`); `share_file` takes `audience_email` and refuses an address that is not on the agent's roster. Rows that predate the migration show as owner-only in the Workspace Files tab. A key caller of the list route gets the audience fields nulled (#2955).
 
 ---
 
@@ -275,7 +310,10 @@ curl -s -H "Authorization: Bearer $TOKEN" http://$HOST:${BACKEND_PORT:-8000}/api
 # [/stats], /api/subscriptions[/{id}/usage]); everything else 403, not admitted to
 # /ws/events. Survives enforced 2FA. Bound to its minting owner: demotion/suspension
 # kills it, so mint it under a dedicated service-admin account. HUMAN-only to mint
-# (any MCP key is refused); the secret is returned ONCE.
+# (any MCP key is refused); the secret is returned ONCE. v1.0.0 (#3043/#3045):
+# creating AND listing keys need a signed-in JWT session for every scope, so a
+# `user`-scoped key can no longer mint or inventory keys, and under enforced 2FA a
+# person must enrol and sign in first. $TOKEN from POST /token still works.
 curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   http://$HOST:${BACKEND_PORT:-8000}/api/mcp/keys -d '{"name": "dashboard", "scope": "ops"}' | jq
 #   then: curl -H "Authorization: Bearer $OPS_KEY" .../api/ops/fleet/health
@@ -293,7 +331,7 @@ curl -s http://$HOST:${BACKEND_PORT:-8000}/api/files/<file_id>?token=<download_t
 
 # List shared files for an agent
 curl -s -H "Authorization: Bearer $TOKEN" \
-  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/files | jq
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/shared-files | jq
 
 # Set Slack DM-default agent for a workspace
 curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
@@ -362,6 +400,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 # wrote an operator-queue ask and EXITED only sees the answer on its next turn
 # (never, for a one-shot agent). Per-agent opt-in, default OFF, costs a run per
 # answer (`triggered_by: operator_response`; audit operator_resume_config/_dispatch).
+# v1.0.0 (ent#611): the same opt-in also wakes the agent on a cancel or an
+# expiry (`triggered_by: operator_ending`), so an opted-in agent costs a run per ENDING.
 # The PUT is HUMAN-only (#2860): an agent-scoped key gets 403; the GET is not.
 curl -s -H "Authorization: Bearer $TOKEN" \
   http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/operator-resume | jq
@@ -371,6 +411,17 @@ curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/j
 # Operator-queue respond (#2376, v0.9.5): for an `approval` item with `options`, the
 # `response` must EXACTLY match one offered option (case-sensitive) — else 422
 # carrying `offered_options`. Send "Approve", not "approved".
+# v1.0.0: respond / cancel / bulk-cancel are PERSON-only (ent#611) — a JWT or
+# the person's own `user` key; agent, system and every other scoped key get 403
+# `person_required`. One reserved off-menu answer exists on agent approvals (#3242):
+# `"response": "(something else)"` plus an instruction in `response_text` (≤4000 chars),
+# else 422 `instruction_required`; platform and skill-gate approvals refuse it
+# (`not_off_menu`). New 409s: `expired`, and `item_diverged` when the agent's file copy
+# changed (#2915) — re-send with `"acknowledge_divergence": true` after reading it.
+# Non-person keys read the queue through an allowlist projection with no person
+# fields; `workspace-problem-*` and `portal-inbox-collision-*` rows are hidden (ent#715).
+# The list returns `total` / `has_more` / `next_cursor`, `undelivered_count` and
+# `closed_by_filer_count`, and takes a repeatable `agent_names` filter (#3303).
 
 # Fan-out batch poll (#2670/#2679, v0.9.5) — `fan_out` now answers with a fan_out_id
 # (sync chat_with_agent answers `queued_timeout` + execution_id instead of a bare
@@ -532,6 +583,13 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/label -d '{"label": "My Agent"}' | jq
 
+# v1.0.0: the retention response gains `quotas.metrics_daily_point_cap` and a
+# third ack-gated sweep (metric points); ops config gains metrics_retention_days (365,
+# 0 = keep forever), metrics_daily_point_cap (100000, 0 = unlimited),
+# operator_queue_aging_hours (24, 0 disables), inter_agent_max_chain_depth (8, 1-32)
+# and event_dispatch_max_fires_per_hour (120, per source→subscriber). Three keys are
+# env-backed (db-row → env → code default): the two metric keys and the chain depth.
+# Setting the env var reports `source: env` and makes the Settings row read-only.
 # Effective data-retention windows + approve an over-threshold prune (#1039/#1644/#1709)
 # Since v0.9.0 the response also carries `backup` (the #2216 automatic-backup status
 # block) and `blocked_sweeps` (#2146: sweeps the guard refuses for a NON-approvable
@@ -561,6 +619,100 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 # Per-agent schedule freeze while git sync is failing (#1808) — view + toggle
 curl -s -H "Authorization: Bearer $TOKEN" \
   http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/git/freeze-schedules-if-failing | jq
+
+# Git sync verdict and container-side pull (ent#703/#706/#707, v1.0.0).
+# sync-state answers WHY: state green|yellow|red|unknown, reason, recommendation,
+# freeze, freeze_cause, diverged_since, dirty_files, last_successful_push_at and the
+# pull columns (last_pull_status, last_pull_error, consecutive_pull_failures/_skips).
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/git/sync-state | jq
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/sync-health | jq
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/fleet/sync-audit | jq     # also MCP get_fleet_sync_audit
+#   GET /api/monitoring/status carries a per-agent `sync` block and `sync_summary`
+#   (git_bound, diverged, frozen, auto_sync_off, dirty, red, yellow)
+# The container pulls origin on its own. GET is agent-readable; the PUT is owner/admin
+# AND person-only, live on the next cycle with no recreate. Needs the rebuilt base image.
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/git/pull-sync | jq
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/git/pull-sync -d '{"enabled": true}' | jq
+#   PUT .../git/auto-sync is authoritative and live since #3010 (the loop reads it each cycle)
+#   POST /api/agents takes kind: agent | deployment (ent#704); the response's `git_mode`
+#   says whether the agent pushes and, when it was created pull-only, why
+
+# Self-change capability grants (ent#164/#596/#756, v1.0.0) — skills.manage,
+# schedules.manage, instructions.manage, agents.manage (+ projects.manage, entitled). GET is
+# owner/admin; the PUT is admin AND a JWT session (a `user` key 403s).
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/capability-grants | jq
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/capability-grants/skills.manage \
+  -d '{"granted": true}' | jq
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/skills/managers | jq      # who holds skills.manage
+
+# Peer skill grants (ent#662, v1.0.0) — an edge exposes the skills the target declares;
+# a LIBRARY skill on another agent needs a per-skill grant. GET is accessor tier; PUT /
+# DELETE take no body, are idempotent, and need an admin JWT session (every key 403s).
+# 422 self_grant | system_agent_not_grantable | skill_not_assigned (target declares it
+# itself — no grant needed). Runtime refusal: 403 skill_not_granted (audit peer_skill_refused).
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/peer-skills | jq
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/peer-skills/<target>/<skill> | jq
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/skills/peer-grants/drift | jq    # admin: last-30-day calls now refused
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/reach/<target> | jq   # {reachable} — edge or spawn record
+
+# Platform role (ent#837) — `user` = Workspace-only. Admin JWT session; keys refused.
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  http://$HOST:${BACKEND_PORT:-8000}/api/users/<username>/role -d '{"role": "operator"}' | jq
+
+# AAuth signed agent identity between instances (ent#623/#862, v1.0.0) — ships DARK.
+# GET admin; PUT admin JWT session (fields enabled, issuer, prototype_enabled,
+# person_server, resource_allowlist; 422 invalid_<field>, 400 nothing_to_change).
+# Live only when enabled AND a valid issuer; until then every AAuth route is a 404.
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/settings/aauth | jq
+
+# Execution timeout (60-7200 s) — person, or an agents.manage holder
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/timeout \
+  -d '{"execution_timeout_seconds": 7200}' | jq
+
+# Declared business metrics (ent#477/#478/#479/#666, v1.0.0, OSS core).
+# GET /metrics is store-only, so it answers for a stopped agent; /objectives drives
+# the container (a stopped agent answers 200 with unavailable: agent_stopped).
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/metrics | jq
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/metrics/definitions | jq
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/metrics/definitions/refresh | jq   # running agent only (409 agent_not_running)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/objectives | jq
+#   Write path is POST .../metrics/points (MCP record_metrics): all-or-nothing 422
+#   invalid_points; 429 rate_limited vs daily_point_cap_exceeded; 2 MiB body cap.
+#   An agent key reads another agent's metrics only with an agent_permissions edge.
+
+# Skill sets and gated skills (ent#530, ent#751-753, v1.0.0, OSS core)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/skills/library/sets | jq
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/skill-sets | jq       # POST/DELETE .../skill-sets/{set}
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/skill-gates | jq      # PUT/DELETE .../skill-gates/{skill}
+#   A gated /<skill> request answers 202 pending_approval and files an ask with a
+#   `gate-` id for the approver (OSS: the primary only). An admin may cancel it but not
+#   approve it. The in-container half needs the rebuilt base image; a gated agent
+#   fails closed (503 gate_unavailable) when it cannot get a verdict.
+
+# Seat decision record (ent#638) — an agent key reaches only its own agent (ent#839)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/agents/myagent/decisions | jq
 
 # Credential env drift (#1999 / #2010) — per-key divergence between the agent's
 # .env and the env its executions actually receive. The ONE view that shows it:
@@ -608,6 +760,23 @@ curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/j
 curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
   http://$HOST:${BACKEND_PORT:-8000}/api/settings/a2a-endpoints/<ref> | jq
 #   Runtime call paths: POST /api/agents/{name}/a2a/call (sync) and .../a2a/task (async)
+#   v1.0.0: the PUT also takes `clear_credentials` and `credential_kind`
+#   (api_key | payment_token; 422 if both) and the outbound control MCP tools are OSS
+#   core (ent#761). A remote that wants payment maps to HTTP 402 `payment_required`;
+#   new failure reasons `payment_rejected`, `rpc_forbidden` (#3185).
+
+# A2A trusted networks — OUTBOUND allowlist only since v1.0.0 (ent#838, narrowed by
+# ent#885): a registered A2A endpoint on a private/CGNAT address or plain http:// is
+# callable only if its host is listed. It grants NO inbound trust; every inbound A2A
+# call needs a credential. Admin; agent keys rejected. `entries` = up to 32 CIDRs /
+# hosts / `*.domain`, replaces the whole list; `[]` turns it off.
+# 422 on overlap with 172.28.0.0/16 or 172.29.0.0/16, loopback/link-local/reserved,
+# broader than /8 (IPv4) or /32 (IPv6), or a one-label wildcard.
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://$HOST:${BACKEND_PORT:-8000}/api/settings/a2a-trusted-networks | jq
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  http://$HOST:${BACKEND_PORT:-8000}/api/settings/a2a-trusted-networks \
+  -d '{"entries": ["10.20.0.0/16"]}' | jq      # internal_base_url is gone (ignored if sent)
 
 # Skills library sources (#1901) — the library is MULTI-SOURCE: a bundled community
 # repo plus per-instance custom repos. Sources CRUD + on-demand sync.
@@ -679,7 +848,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Database Operations
 
-> **Backend depends on `DATABASE_URL`.** The `sqlite3` recipes below target the **default SQLite** backend (file in the `trinity_trinity-data` volume). If the instance runs on **PostgreSQL** (see [Database Backend](#database-backend-sqlite-default--postgresql-300)), query it with `psql` instead — e.g. `./scripts/run.sh "sudo docker exec trinity-postgres psql -U trinity -d trinity -c 'SELECT agent_name, owner_id FROM agent_ownership'"`. Schema is identical across both backends.
+> **Backend depends on `DATABASE_URL`.** The `sqlite3` recipes below target the **default SQLite** backend (file in the `trinity_trinity-data` volume). If the instance runs on **PostgreSQL** (see [Database Backend](#database-backend-sqlite-default--postgresql-300)), query it with `psql` instead — e.g. `./scripts/run.sh "sudo docker exec trinity-postgres psql -U trinity -d trinity -c 'SELECT agent_name, owner_id FROM agent_ownership'"`. Schema is identical across both backends. A **hosted install on v1.0.0** runs the bundled PostgreSQL unless it predates #3159, so check first: `./scripts/run.sh "sudo docker exec trinity-backend printenv DATABASE_URL"` (empty = SQLite).
+
+The recipes mount the dev named volume `trinity_trinity-data`. On a **prod or hosted bind-mount install** that name mounts (and creates) an empty volume: use `-v ${TRINITY_DATA_PATH}:/data` instead (default `<TRINITY_PATH>/trinity-data`).
 
 ```bash
 # List tables
@@ -722,8 +893,19 @@ Key tables:
 | `subscription_headroom_history` | One row per subscription-headroom probe (ent#433, v0.9.5) — 5h/7d utilisation for trends. Pruned by the new ops key `subscription_headroom_retention_days` (30) |
 | `portal_file_dismissals` | Per-viewer "remove from my list" of an `agent_shared_files` row in the Workspace (#2582, v0.9.5) |
 | `user_ui_preferences` | Per-user server-side UI state — Dashboard grid layout, tile prefs (ent#413 / #2561, v0.9.5); replaces localStorage. `GET/PUT/DELETE /api/users/me/preferences[/{key}]` |
+| `agent_capability_grants` | Self-change grants (ent#164 / ent#596, v1.0.0, Alembic `0072`) — `agent_name`, `capability`, `granted_by`, `granted_at`. No seed: empty after upgrade |
+| `agent_peer_skill_grants` | Per-skill peer grants (ent#662, v1.0.0, Alembic `0099`) — `caller_agent`, `target_agent`, `skill_name`, `granted_by`, `granted_at`; PK on the first three, both agent columns cascade on purge. Empty after upgrade |
+| `metric_definitions` / `metric_points` | Declared business metrics (ent#477 / #478, `0069` / `0070`; `revision` + `recorded_at` in `0086`). Definitions are retired, never deleted. Points are swept by `metrics_retention_days` (365) in the 5-minute cleanup cycle, ack-gated |
+| `agent_skill_sets` | Skill sets held by an agent (ent#530, `0080`); `agent_skills.individual` marks a skill assigned on its own |
+| `agent_skill_gates` / `skill_gate_requests` | Per-agent skill gate map and the approval requests it raises (ent#751–753, `0094` / `0088`). No sweep |
+| `seat_decisions` | Why a thing was approved, deferred or killed, per seat (ent#638, `0071`). No sweep |
+| `agent_role_readiness` | Readiness stamp behind the role card and the held companion brief (ent#527 / ent#689, `0067`; `0074` stamps agents with an existing live brief `ready`) |
+| `public_user_memory_writes` | Undo ledger for memory written by a schedule that runs as a named seat (ent#637, `0066`). No sweep |
+| `workspace_suggestion_feedback` | Workspace suggestion feedback (ent#465, `0078`) |
 
 **v0.9.5 columns worth knowing:** `agent_ownership.operator_resume_enabled` (#2312, default 0), `schedule_executions.turn_integrity` (#2467 — JSON `background_tasks_killed` / `_pending_at_exit`; **NULL = no evidence, not healthy**), `schedule_executions.open_canvas_id` / `source_channel_client` / `fan_out_task_id` (#2524, Alembic `0062`), `agent_sync_state.git_dir_bytes` now BIGINT on PostgreSQL (#2800, `0063` — an agent whose `.git` passed 2 GiB used to fail every sync-state upsert with `integer out of range`), room turns stamp `source_channel_chat_id = <room_id>` under channel value `room` (#2792), `agent_schedules.deliver_to_workspace_email` (ent#498 — a refused delivery **fails the run**), `agent_loops.next_run_at` / `stop_requested_at` (#2523 — loops are terminal-driven rows that survive a backend restart; no more `interrupted` on boot), `operator_queue.addressed_to_email` and `agent_reports.addressed_to_email` / `portal_session_id` (ent#364/#365 — asks and reports addressed to a Workspace client), `subscription_rate_limit_events.failure_kind` (429 vs auth, #471), `agent_evaluations.target_kind` / `target_id` / `comment` (Workspace ratings, ent#366 — comments are redacted for every non-human principal). Alembic head at 0.9.5: `0063_agent_sync_state_git_dir_bytes_bigint` (64 revisions, one head). **Data migration `0041_secret_settings_encryption`** rewrites six credential rows into `<key>_encrypted` envelopes and deletes the plaintext — see [Update Trinity](#update-trinity).
+
+**v1.0.0 columns** (Alembic head `0100_admin_email_not_username`, 101 revisions, one head): `operator_queue` gains the endings ledger `disposition` (answered / cancelled / dismissed / expired), `disposed_by` (person / timeout / platform), `disposed_by_email`, `disposition_reason`, `batch_id` (`0076`), the file-sync truth `sync_state` / `delivery_state` (`0073`), and a per-condition `subject` with `last_seen_at` (`0090`); `schedule_executions.chain_depth` (`0077`), `.conversation_key` with the unique index `idx_executions_one_running_turn` (`0083`), `.source_host` (inert since ent#885); `agent_loops.chain_depth` (`0084`); `agent_git_config.pull_sync_enabled` and `agent_sync_state.last_pull_at` / `last_pull_status` / `last_pull_error` / `behind_after_pull` / `last_successful_pull_at` / `consecutive_pull_failures` / `consecutive_pull_skips` (`0087`), plus `diverged_since` / `dirty_files` / `dirty_since` / `last_successful_push_at` (`0082`); `agent_ownership.a2a_scope` and `a2a_keyless_internal` (`0096`, **inert since ent#885** — nothing reads them; to be dropped under #746); `operator_queue.replaces` / `replaced_by` (`0097`, an agent replacing its own ask); `agent_sharing.allow_proactive` now NULL = never asked, 0 = declined, 1 = consented (`0098`); `agent_skills.delivery_status` (`0065`, adds `conflict`) and `.assigned_by_agent`; `agent_shared_files.addressed_to_email` / `addressed_to_channel` / `audience_source` (`0068`); `telegram_bindings.can_read_all_group_messages`, `telegram_group_configs.context_enabled` / `last_untagged_seen_at` (`0079`); `chat_sessions.cached_claude_session_id` (`0091`); `enterprise_portal_messages.attachments` / `.execution_id` (`0092` / `0095`); `email_login_codes.purpose` and the unique index `idx_users_email_unique` (`0085`).
 
 **Channel columns (#2 channels wave):** `telegram_bindings.progress_indicator_enabled` (per-binding in-flight reaction ack, default 1), `telegram_group_configs.allow_proactive` (per-group proactive send consent, default 1), and `schedule_executions.source_channel_agent` (which channel-bound agent originated a run, for completion report-back).
 
@@ -739,8 +921,9 @@ Trinity runs on any Linux VM with Docker. Choose your provider:
 |----------|-------|-----------------|
 | **Hetzner** | `provision/hetzner.md` | CX33 at ~€6-7/month |
 | **Google Cloud** | `provision/gcp.md` | e2-standard-2 ~$65/month |
-| **AWS** | `provision/aws.md` | t3.large ~$60/month |
+| **AWS** | `provision/aws.md` | t3.large ~$60/month (manual) · t3a.large 8 GiB (`--provision --cloud aws`, v1.0.0) |
 | **DigitalOcean** | `provision/digitalocean.md` | s-4vcpu-8gb $48/month (manual or one-command) |
+| **Vultr** | `provision/vultr.md` | 8 GB plan (`--provision --cloud vultr`, v1.0.0) |
 | **Localhost** | `provision/localhost.md` | Free |
 
 All guides provision Ubuntu 24.04 with Docker via cloud-init, then walk you through installing Trinity and pointing this ops agent at the instance.
@@ -749,7 +932,9 @@ All guides provision Ubuntu 24.04 with Docker via cloud-init, then walk you thro
 
 The documented path (user guide: `https://docs.ability.ai/getting-started/deploying/digitalocean`; source in the `trinity-docs` repo) runs `trinity-do-create.sh` on **your** machine. It creates an `s-4vcpu-8gb` Ubuntu 24.04 droplet (~$48/month), provisions it, installs from prebuilt images, and waits for HTTPS on the droplet's IP. Full walkthrough: `provision/digitalocean.md`.
 
-**Prerequisites:** a DigitalOcean account; `doctl` (`brew install doctl`) signed in with `doctl auth init` using an API token with **Write** scope; a Claude Pro/Max subscription and its token from `claude setup-token` (the `sk-ant-oat01-…` value — an `sk-ant-api03-…` API key is rejected); Claude Code (WSL on Windows).
+**The script differs by tag.** At the `v0.9.5` tag it asks four questions, including the Claude subscription token, and registers the subscription itself, as described below. At `v1.0.0` (#2867) it asks **three**: admin password twice, region, droplet name. No Claude credential is asked for and the user-data carries only the admin password; Claude is connected in the browser on first sign-in (the blocking **Connect Claude** step takes a subscription token *or* an API key and validates it with Anthropic). A 1.0 droplet also runs on the bundled PostgreSQL (#3159). The script's default tag is `v1.0.0`. A live DigitalOcean 1-Click listing exists too (`marketplace.digitalocean.com/apps/trinity`); it can be deployed below the 8 GB floor (#3009), so pick at least 8 GB.
+
+**Prerequisites:** a DigitalOcean account; `doctl` (`brew install doctl`) signed in with `doctl auth init` using an API token with **Write** scope; a Claude Pro/Max subscription and its token from `claude setup-token` (the `sk-ant-oat01-…` value — an `sk-ant-api03-…` API key is rejected by the v0.9.5 script; either works in the browser step at v1.0.0); Claude Code (WSL on Windows).
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/abilityai/trinity/<tag>/scripts/deploy/trinity-do-create.sh)
@@ -758,13 +943,31 @@ bash <(curl -fsSL https://raw.githubusercontent.com/abilityai/trinity/<tag>/scri
 ```
 
 - **Checks before it asks for anything:** `doctl` installed and signed in. A snap-installed `doctl` gets its user-data file under `$HOME`, because snap gives it a private `/tmp`.
-- **Four prompts:** admin password twice (12+ characters, and it may not *start with* `password`, `admin`, `trinity`, `changeme` or `letmein`; the username is always `admin`), the subscription token, a region (default `fra1`; the prompt lists nyc3, sfo3, lon1, sgp1), and a droplet name (default `trinity`). It then shows the cost and asks `y/N`. The secrets are read with `read -rs`, so they stay out of shell history and off the screen. The only copy is the droplet's user-data (see [Provisioned hosts](#provisioned-hosts-firewall-metadata-service-and-private-network-access-2707--2522--2692)).
-- **What the droplet does on first boot:** attaches every SSH key already on the account. Clones the tag into `/opt/trinity`. Runs `start.sh --provision --cloud digitalocean --hosted --unattended`: Docker, Caddy with a Let's Encrypt **IP** certificate, ufw on 22/80/443 and the `TRINITY-FW` container firewall, then the hosted install with `ADMIN_PASSWORD` preset, so there is **no browser-claim window**. Finally it mints a token (`POST /api/token`), registers the subscription as `claude-subscription` (`POST /api/subscriptions`) and attaches it to every seeded agent (`PUT /api/subscriptions/agents/{name}?subscription_name=claude-subscription`). Agents created later pick it up automatically.
+- **Four prompts (v0.9.5 script; three at v1.0.0, without the token):** admin password twice (12+ characters, and it may not *start with* `password`, `admin`, `trinity`, `changeme` or `letmein`; the username is always `admin`), the subscription token, a region (default `fra1`; the prompt lists nyc3, sfo3, lon1, sgp1), and a droplet name (default `trinity`). It then shows the cost and asks `y/N`. The secrets are read with `read -rs`, so they stay out of shell history and off the screen. The only copy is the droplet's user-data (see [Provisioned hosts](#provisioned-hosts-firewall-metadata-service-and-private-network-access-2707--2522--2692)).
+- **What the droplet does on first boot:** attaches every SSH key already on the account. Clones the tag into `/opt/trinity`. Runs `start.sh --provision --cloud digitalocean --hosted --unattended`: Docker, Caddy with a Let's Encrypt **IP** certificate, ufw on 22/80/443 and the `TRINITY-FW` container firewall, then the hosted install with `ADMIN_PASSWORD` preset, so there is **no browser-claim window**. Finally, on the v0.9.5 script only, it mints a token (`POST /api/token`), registers the subscription as `claude-subscription` (`POST /api/subscriptions`) and attaches it to every seeded agent (`PUT /api/subscriptions/agents/{name}?subscription_name=claude-subscription`). Agents created later pick it up automatically. The v1.0.0 script stops after the install and prints `=== Trinity is ready at https://<ip> ===`.
 - **Timing:** about 6 minutes. The script polls `https://<ip>/` with normal certificate verification and gives up after **15 minutes**. On a timeout, open the droplet's web **Console** and run `tail -50 /var/log/trinity-install.log`.
 - **After it succeeds:** sign in as `admin` and finish the first-run **"Secure this instance"** step.
 - **Delete:** `doctl compute droplet delete <name>` destroys everything, including agents and `/data/backups`. Take a droplet snapshot first if you need to keep anything.
 
-On the droplet, Trinity lives in `/opt/trinity`, the frontend listens on `FRONTEND_PORT=8081` behind Caddy, and `TRINITY_INSTALL_SOURCE=do-script` is recorded. To point this ops agent at it, set `SSH_USER=root`, `TRINITY_PATH=/opt/trinity`, `COMPOSE_FILE=docker-compose.hosted.yml`, `FRONTEND_PORT=8081`. Upgrade by bumping `TRINITY_IMAGE_TAG` in `/opt/trinity/.env`, then run `sudo ./scripts/deploy/start.sh --hosted`.
+On the droplet, Trinity lives in `/opt/trinity`, the frontend listens on `FRONTEND_PORT=8081` behind Caddy, and `TRINITY_INSTALL_SOURCE=do-script` is recorded. To point this ops agent at it, set `SSH_USER=root`, `TRINITY_PATH=/opt/trinity`, `COMPOSE_FILE=docker-compose.hosted.yml`, `FRONTEND_PORT=8081`. Upgrade by bumping `TRINITY_IMAGE_TAG` in `/opt/trinity/.env`, checking out the matching tag (`git fetch --tags && git checkout <tag>` — the droplet is a `--depth 1 --branch <tag>` clone, so `git pull` is not the upgrade), then run `sudo ./scripts/deploy/start.sh --hosted`.
+
+### AWS and Vultr one-command installs (v1.0.0, #3004 / #2282)
+
+`start.sh --provision` now accepts `--cloud digitalocean | vultr | aws`. v0.9.5 and earlier reject the two new values. Both end on the same hosted stack as the DigitalOcean path: `/opt/trinity`, `COMPOSE_FILE=docker-compose.hosted.yml`, `FRONTEND_PORT=8081` behind Caddy, bundled PostgreSQL. Full walkthroughs: `provision/aws.md`, `provision/vultr.md`.
+
+**AWS** — as root on a fresh Ubuntu 24.04 x86_64 instance with 8 GiB (`t3a.large`), a public IPv4 and a security group open on 80/443:
+
+```bash
+git clone --depth 1 --branch <release-tag> https://github.com/abilityai/trinity.git /opt/trinity
+cd /opt/trinity && ./scripts/deploy/start.sh --provision --cloud aws --hosted --unattended
+```
+
+- Reads the public IP over IMDSv2 and records `TRINITY_INSTALL_SOURCE=aws-script`.
+- **Instance-ID claim:** with no `ADMIN_PASSWORD` in the environment or `.env`, it sets `ADMIN_PASSWORD_SOURCE=instance-id` and writes the instance ID to `trinity-data/setup-claim` (0600). `/setup` then asks for the **EC2 instance ID** as well; a wrong value gets one generic 403, rate-limited per IP. The file is consumed when the admin is created. Email is optional on this path (blank = sign in as `admin`). Pass `ADMIN_PASSWORD='…'` in the environment to skip the claim.
+- **`trinity-ip-refresh.timer`** (installed on every `--provision` cloud) runs `start.sh --provision --cloud <cloud> --refresh-ip` a minute after boot and every five minutes. On a changed public IP it re-renders the Caddyfile, gets a certificate for the new address, rewrites `FRONTEND_URL` only if it still pointed at the old IP, and recreates the backend from local images. It never pulls or upgrades. With no public IPv4 at first boot the install stops, leaves `/etc/trinity/site-pending`, and the timer finishes it within five minutes of an address appearing. The timer runs the checkout's `start.sh` as root, so keep `/opt/trinity` root-owned.
+- `packer/aws/trinity.cfn.yaml` (CloudFormation: instance, security group on 80/443, Elastic IP, no IAM role; outputs `TrinityUrl` and `InstanceId`) is in the repo. The **AWS Marketplace AMI is live** (`https://aws.amazon.com/marketplace/pp/prodview-q6f3biwa662o2`, `t3a.large`+, install source `aws-marketplace`, always the instance-ID claim); the one-click Launch Stack link is **not published yet** — use the template with the AMI ID from your Marketplace subscription as `ImageId`. User guide on the server: `docs/user-docs/guides/deploying/aws.md`.
+
+**Vultr** — `start.sh --provision --cloud vultr [--hosted --unattended]` by hand records provenance `script` (no hardening card) and, with no password, generates and prints one. The Marketplace app is **imageless**: Vultr runs `scripts/deploy/vultr-vendor-data.sh` at first boot (it also works as plain User Data). It resolves `releases/latest`, clones to `/opt/trinity`, exports `ADMIN_PASSWORD_SOURCE=browser` and runs `start.sh --provision --cloud vultr --provenance vultr-marketplace --hosted --unattended`. First boot takes about 4 minutes; it warns below 8 GB but installs anyway. Log: `/var/log/trinity-install.log` (appended across attempts, read from the last `=== Trinity first boot:` header). Markers: `/etc/trinity/ready` vs `/etc/trinity/firstboot-failed`. Retry by re-running the same `start.sh` command from `/opt/trinity`; never `cloud-init clean`. `releases/latest` resolves to v1.0.0, which accepts `--cloud vultr`, so the imageless install now completes.
 
 **Custom domain:**
 1. Create an `A` record pointing at the droplet (with Cloudflare DNS, set the record to **DNS only**, not proxied, unless you use a tunnel).
@@ -785,7 +988,7 @@ Then close 80/443 with a cloud firewall. Closing them also stops Caddy renewing 
 | Resource | Minimum | Recommended |
 |----------|---------|-------------|
 | CPU | 2 vCPU | 4 vCPU |
-| RAM | 8 GB (source build and `--hosted`) | 16 GB |
+| RAM | 8 GB (source build and `--hosted`; `start.sh` does not check it, and only the Vultr first-boot script warns) | 16 GB |
 | Disk | 20 GB | 50 GB |
 | OS | Ubuntu 22.04+ | Ubuntu 24.04 |
 
@@ -797,7 +1000,7 @@ Since v0.9.5 there are **three standalone compose stacks**, and they must never 
 |-------|---------|--------|------------|
 | **dev** | `docker compose up -d` (+ auto override) | built locally | named volume `trinity_trinity-data` |
 | **prod** | `docker compose -f docker-compose.prod.yml up -d` (+ `-f docker-compose.prod.enterprise.yml`) | built locally (`update.sh`) | bind mount `${TRINITY_DATA_PATH:-./trinity-data}` |
-| **hosted** | `./scripts/deploy/start.sh --hosted` → `docker-compose.hosted.yml` | pulled from `ghcr.io/abilityai/trinity-{backend,frontend,scheduler,mcp-server}:${TRINITY_IMAGE_TAG}` | bind mount, as prod |
+| **hosted** | `./scripts/deploy/start.sh --hosted` → `docker-compose.hosted.yml` | pulled from `ghcr.io/abilityai/trinity-{backend,frontend,scheduler,mcp-server}:${TRINITY_IMAGE_TAG}` | bind mount, as prod. v1.0.0 (#3159): the database is the bundled `trinity-postgres` (volume `trinity_postgres-data`) on a fresh install; an install with an existing `trinity.db` stays on SQLite |
 
 `-f docker-compose.yml -f docker-compose.prod.yml` is **wrong**: Compose merges list keys by concatenation, so Compose ≥ 2.24 fails on the duplicated `group_add` and older Compose silently doubles the frontend `ports` (host→80 *and* host→8080), after which nginx crash-loops on `host not found in upstream`. `start.sh` also **refuses** to bring a dev-stack database up under prod/hosted (or vice versa) and warns when both stores exist, printing the `alpine cp -a` recipe to move data across — a bare `docker compose up -d` on a prod host otherwise boots an empty DB on a healthy-looking backend.
 
@@ -855,7 +1058,7 @@ curl http://localhost:8000/health
 
 **Unattended install (#1708):** `./scripts/deploy/start.sh --unattended` (or `TRINITY_UNATTENDED=1`) removes the interactive hard-stops — a missing `ADMIN_PASSWORD` is auto-generated and printed in the end-of-run summary instead of blocking on a prompt (and since #2385 that printed password actually works). Use for scripted/agent-driven installs. An `ADMIN_PASSWORD` present in the *environment* is written through to `.env` (never overwriting an existing one, #2707).
 
-**Provisioning a bare VM in place (v0.9.5, #2707):** `sudo ./scripts/deploy/start.sh --provision --cloud digitalocean [--machine-only|--site-only|--caddy-only] [--hosted --unattended]` installs Docker CE, Caddy (pinned 2.11.4, floor 2.11.3 for IP certificates), ufw (22/80/443), the `trinity-docker-firewall.service` (drops container traffic to `169.254.0.0/16` and every off-box path to a published port), writes `FRONTEND_PORT=8081` / `FRONTEND_URL=https://<ip>` / `TRINITY_INSTALL_SOURCE=do-script`, waits ~150s for a real certificate (`/etc/trinity/tls-status`, `journalctl -u caddy`), then continues into the normal install. It **refuses unless root + Linux + the DO metadata service answers**, so it is inert on a laptop. Only `--cloud digitalocean` exists today. `--caddy-only` (#2692) re-renders `/etc/caddy/Caddyfile` from the IP stored in `/etc/trinity/public-ip` and the recorded `TRINITY_INSTALL_SOURCE`, then exits. That is the way to apply `PRIVATE_NETWORK_CIDRS`. The Caddyfile is validated before the swap and written 0644. An rc4 1-Click image wrote it 0600 under `umask 077`, so Caddy could not read it and provisioning stopped before Trinity started (#2862, fixed in v0.9.5).
+**Provisioning a bare VM in place (v0.9.5, #2707):** `sudo ./scripts/deploy/start.sh --provision --cloud digitalocean [--machine-only|--site-only|--caddy-only] [--hosted --unattended]` installs Docker CE, Caddy (pinned 2.11.4, floor 2.11.3 for IP certificates), ufw (22/80/443), the `trinity-docker-firewall.service` (drops container traffic to `169.254.0.0/16` and every off-box path to a published port), writes `FRONTEND_PORT=8081` / `FRONTEND_URL=https://<ip>` / `TRINITY_INSTALL_SOURCE=do-script`, waits ~150s for a real certificate (`/etc/trinity/tls-status`, `journalctl -u caddy`), then continues into the normal install. It **refuses unless root + Linux + the cloud's metadata service answers**, so it is inert on a laptop. `--cloud digitalocean` is the only value at v0.9.5; v1.0.0 adds `vultr` and `aws`, plus `--refresh-ip` (run by `trinity-ip-refresh.timer`) and `--provenance <source>`. `--caddy-only` must name the instance's real cloud. `--caddy-only` (#2692) re-renders `/etc/caddy/Caddyfile` from the IP stored in `/etc/trinity/public-ip` and the recorded `TRINITY_INSTALL_SOURCE`, then exits. That is the way to apply `PRIVATE_NETWORK_CIDRS`. The Caddyfile is validated before the swap and written 0644. An rc4 1-Click image wrote it 0600 under `umask 077`, so Caddy could not read it and provisioning stopped before Trinity started (#2862, fixed in v0.9.5).
 
 On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you to set your admin password and configure API keys. Since #2385 the wizard's `POST /api/setup/admin-password` **refuses when a usable admin already exists**, so an install booted with `ADMIN_PASSWORD` set never shows the claim step (see [Browser admin claim](#browser-admin-claim-on-marketplace-images-ent580--2715)). After first-time setup, a genuinely fresh install auto-deploys a bundled starter fleet once (#1764); set `TRINITY_DEFAULT_SYSTEM_MANIFEST=disabled` beforehand to skip it, or point it at your own manifest file.
 
@@ -875,7 +1078,7 @@ On first launch, open `http://<SERVER_IP>` — the setup wizard will prompt you 
 | `trinity-vector` | 8686:8686 | Log aggregation — runs as root but joins GID 1000 via `group_add` (#1799) so its file sink can write the UID-1000-owned `/data/logs`; `cap_drop: ALL` strips `CAP_DAC_OVERRIDE`, so without the group root's writes fail *silently* (healthcheck stays green) |
 | `trinity-logs-init` | — | One-shot `alpine` init (#1478): `chown 1000:1000 /data/logs` so UID-1000 Vector retention can write. Backend `depends_on` it (`service_completed_successfully`); exits immediately, `restart: no` |
 | `trinity-archives-init` | — | **Dev compose only** — the missed sibling of `logs-init` (#2205, v0.9.0): `chown 1000:1000 && chmod 775 /data/archives` on the named `trinity-archives` volume, which Docker creates root-owned, so the UID-1000 backend could never write it and log archival died silently on every run. Runs on every `up` (repairs existing installs, idempotent); backend `depends_on` it. **Prod needs none**: `/data/archives` lives inside the `${TRINITY_DATA_PATH}` bind mount that `start.sh` chowns recursively |
-| `trinity-postgres` | 5432:5432 | **Optional** PostgreSQL backend (#300) — dev-compose only, behind `--profile postgres`. Off by default (SQLite). See [Database Backend](#database-backend-sqlite-default--postgresql-300). |
+| `trinity-postgres` | 5432:5432 (dev) · none (hosted) | PostgreSQL backend (#300). **Dev compose:** optional, behind `--profile postgres`, off by default (SQLite). **Hosted compose (v1.0.0, #3159):** always present, no profile, no host port, DB and user fixed at `trinity`, volume `trinity_postgres-data`; backend and scheduler wait for it healthy. **Prod compose:** none. See [Database Backend](#database-backend-sqlite-default--postgresql-300). |
 | `trinity-cloudflared` | — | Cloudflare Tunnel — **profile-gated** (`--profile tunnel` / `COMPOSE_PROFILES=tunnel`) in every stack; only `start.sh --hosted` activates it automatically when `TUNNEL_TOKEN` is set |
 | `agent-{name}` | — | Per-agent isolated containers — `restart: unless-stopped` since v0.9.5 (#2541; pre-upgrade containers keep `no` until recreated or swept) |
 
@@ -904,13 +1107,24 @@ Trinity selects its database from a single env var, `DATABASE_URL`, resolved at 
 | `sqlite:////data/trinity.db` | SQLite (explicit) |
 | `postgresql://user:pass@host:5432/dbname` | **PostgreSQL** |
 
-Both the backend and the standalone scheduler read the same `DATABASE_URL`, so they always agree on the store. The flag is **not sticky** — switching is non-destructive (the two stores are independent volumes); comment it out and the next restart is back on SQLite.
+Both the backend and the standalone scheduler read the same `DATABASE_URL`, so they always agree on the store. The flag is **not sticky** — switching is non-destructive (the two stores are independent volumes); comment it out and the next restart is back on SQLite. **That last step is true on dev and prod only.**
+
+**Hosted stack on v1.0.0 (#3159) inverts the unset case.** `docker-compose.hosted.yml` reads `${DATABASE_URL-postgresql://trinity:${POSTGRES_PASSWORD}@postgres:5432/trinity}` (no colon), so:
+
+| `DATABASE_URL` in the hosted `.env` | Backend |
+|-------------------------------------|---------|
+| no line at all | **bundled PostgreSQL** (`trinity-postgres`) |
+| `DATABASE_URL=` (empty) | SQLite at `/data/trinity.db` |
+| `postgresql://…` | that server |
+
+`start.sh --hosted` decides once (`ensure_hosted_database`): it generates `POSTGRES_PASSWORD` if absent; on a fresh install it writes the bundled URL (`Fresh install: database is the bundled PostgreSQL`); where `trinity-data/trinity.db` exists it writes `DATABASE_URL=` and keeps SQLite, printing the end-of-support pointer on every run. An uncommented `DATABASE_URL` line, even an empty one, counts as a choice already made. Deleting or commenting the line on a hosted SQLite install therefore boots an **empty PostgreSQL** (`setup_required` on a healthy-looking backend): put `DATABASE_URL=` back and re-run `start.sh --hosted`. To move a hosted SQLite install over, migrate the data into the bundled server (`/migrate-to-postgres`, hosted branch), then set `DATABASE_URL` to the bundled URL.
 
 **Dev vs prod is the key ops distinction:**
 - **Dev `docker-compose.yml`** bundles a `postgres:16-alpine` service (container `trinity-postgres`) gated behind the `postgres` **compose profile**. Enable with `POSTGRES_PASSWORD` set, then `docker compose --profile postgres up -d`.
 - **Prod `docker-compose.prod.yml` ships NO postgres service.** A `postgresql://` URL in prod must point at an **operator-managed** PostgreSQL (RDS, Cloud SQL, a separate VM). The backend/scheduler/agent containers must be able to reach that host:port.
+- **Hosted `docker-compose.hosted.yml` bundles one since v1.0.0** (see the table above). `POSTGRES_PASSWORD` is required to render the file even on an install that stays on SQLite.
 
-**On first (cold) start** against an empty Postgres, the backend runs `alembic upgrade head` — the `0001_baseline` revision builds the ~61 base tables plus append-only audit-log triggers, the incremental revisions on top of it (`0063_agent_sync_state_git_dir_bytes_bigint` is head at 0.9.5) bring the schema to head, then the admin user is seeded from `ADMIN_PASSWORD`. **Check `alembic heads` after an upgrade**: revisions `0043` and `0044` forked briefly and `0045` merges them — with two heads, `alembic upgrade head` applies nothing and says nothing (`docker exec trinity-backend alembic heads`). The instance starts in first-run setup (`setup_required` on login is expected, not an error). Alembic owns the PG schema; **SQLite keeps its separate `db/migrations.py` runner** — the two coexist during the transition.
+**On first (cold) start** against an empty Postgres, the backend runs `alembic upgrade head` — the `0001_baseline` revision builds the ~61 base tables plus append-only audit-log triggers, the incremental revisions on top of it (`0063_agent_sync_state_git_dir_bytes_bigint` is head at 0.9.5, `0100_admin_email_not_username` at v1.0.0) bring the schema to head, then the admin user is seeded from `ADMIN_PASSWORD`. **Check `alembic heads` after an upgrade**: revisions `0043` and `0044` forked briefly and `0045` merges them — with two heads, `alembic upgrade head` applies nothing and says nothing (`docker exec trinity-backend alembic heads`). Revision `0064` (v1.0.0) runs `CREATE EXTENSION IF NOT EXISTS pg_trgm` and deliberately fails the boot if it cannot: on a managed PostgreSQL create the extension as an admin first. The instance starts in first-run setup (`setup_required` on login is expected, not an error). Alembic owns the PG schema; **SQLite keeps its separate `db/migrations.py` runner** — the two coexist during the transition.
 
 **Migrating an existing SQLite instance:** upstream's `init_database()` only *bootstraps* a fresh PG DB — it has no SQLite→PG data copy. This ops agent ships the **`/migrate-to-postgres`** skill (`.claude/skills/migrate-to-postgres/`) to close that gap: it stands up Postgres alongside the running instance, trial-copies + validates the data via a dialect-aware ETL, then cuts over in a short downtime window with one-line rollback (the SQLite file is never written). Gated at every state-changing step.
 
@@ -922,7 +1136,7 @@ Both the backend and the standalone scheduler read the same `DATABASE_URL`, so t
 
 **Backups:** automatic for **both** backends since v0.9.0 (#2216) — nightly `trinity-backup-YYYYMMDD.db` (SQLite backup API) or `.dump` (`pg_dump -Fc`, client baked into the backend image) under `/data/backups`, plus a boot-time `pre-migration-*.db` when a migration is pending. Manual: `scripts/backup.sh` (SQLite `.backup` / bundled-PG `pg_dump -Fc`). See [Backup Database](#backup-database).
 
-**Rollback to SQLite:** comment out `DATABASE_URL`, `docker compose up -d` — the Postgres volume is untouched and can be re-enabled later.
+**Rollback to SQLite:** dev/prod: comment out `DATABASE_URL`, `docker compose up -d`. Hosted (v1.0.0): set `DATABASE_URL=` (empty, never absent) and re-run `start.sh --hosted`. Either way the Postgres volume is untouched and can be re-enabled later.
 
 Full guide on the server: `docs/POSTGRESQL_SETUP.md` (covers verification, pooling tunables, dialect gotchas). Selector code: `src/backend/db/engine.py`.
 
@@ -955,6 +1169,46 @@ Further hardening is tracked in [`abilityai/trinity#1523`](https://github.com/ab
 - **MCP tool surface has one agent-permission gate** (ent#628/#2826). `run_agent_loop`, `get_loop_status` and `stop_loop` now require an `agent_permissions` edge: before this, an agent key could start a loop on any agent with the same owner. `get_loop_status` and `stop_loop` refuse without naming the loop's agent, and the owner can still stop it. Every registered tool declares an access policy, and unknown key scopes are denied. The REST loop routes are unchanged and remain owner-equivalent (ent#629).
 - **Refused MCP calls are audited as refusals** (#2807). The row is `success:false, denied:true, error:<reason>`; before, a denied `chat_with_agent` / `fan_out` / `run_agent_loop` was logged as a success. The JSON the caller receives is unchanged.
 
+### Self-change grants and person-only routes (v1.0.0, ent#164 / ent#596 / #2996)
+
+An `agent_permissions` edge no longer implies the right to reshape an agent. An **agent key** now needs a row in `agent_capability_grants` for each of four capabilities, and no agent holds any after the upgrade (no seed, existing and new agents alike). UI since v1.0.0: Agent Settings → Guardrails → Bounds → "Permissions to change itself":
+
+| Capability | What it gates for an agent key |
+|---|---|
+| `skills.manage` | Assigning, removing or injecting skills on any agent, **its own included**, and file writes under `.claude/skills/**` |
+| `schedules.manage` | Schedule create / update / delete / enable / disable and webhook routes on **another** agent (its own schedules are exempt; trigger is not fenced) |
+| `instructions.manage` | `CLAUDE.md`, `AGENTS.md` and `.claude/**` through the file routes, plus `git/reset-to-main-preserve-state`. Own included |
+| `agents.manage` | `POST /api/agents`, `DELETE /api/agents/{n}`, `deploy-local`, `POST /api/systems/deploy`, and the model / read-only / resources / timeout / public-channel-model / guardrails PUTs. Ephemeral spawn and discard are exempt; `read-only` and `guardrails` stay person-only when the target is the holder itself |
+| `projects.manage` | Entitled installs only (v1.0.0, ent#661): starting Workspace projects over MCP (`create_project` / `import_project`). UI label "Start projects" |
+
+- **Who passes without a grant:** a JWT, a `user` key, the `system` key. `connector`, `ops`, `portal_delegate` and unknown scopes are refused outright. A holder reaches only agents its owner owns (404 otherwise).
+- **Refusal:** 403 `{"detail":{"code":"skill_management_not_permitted" | "schedule_…" | "instruction_…" | "agent_management_not_permitted", "capability": …}}`, audited as `capability_refused`.
+- **Granting is admin and JWT-only** (`PUT /api/agents/{name}/capability-grants/{capability}`, see [API Access](#api-access)); a `user` key 403s, and approving the agent's own permission ask grants nothing. `trinity-system`, ephemeral and calibrating agents cannot be granted (422). UI: Agent Settings → "Permissions to change itself"; Settings → Agents → Skill managers.
+
+Two refusal tiers now sit behind the older "human-only" wording, both answering 403 `{"code":"person_required"}` before any 404:
+
+- **Person** (a JWT or the person's own `user` key): `PUT /api/agents/{n}/{api-key-setting,autonomy,capabilities,capacity}`, `PUT …/git/pull-sync`, operator-queue respond / cancel / bulk-cancel. The `system` key is refused here too.
+- **Interactive** (a JWT session only): `POST /api/mcp/keys` for every scope, `GET /api/mcp/keys`, `POST /api/mcp/keys/ensure-default`, the grant PUTs above, `POST /api/users/me/email/code`, `PUT /api/users/me/email`, `PUT`/`DELETE /api/users/me/github-pat`. Under enforced 2FA there is therefore no machine path to mint or inventory keys.
+
+Related hardening in the same range:
+
+- **Chain depth** (#2806 / #2973): an agent-to-agent hop past `inter_agent_max_chain_depth` (default 8, bounds 1–32) on `/chat`, `/task`, `/fan-out`, loop start, schedule trigger, session turn or event emit gets 403 `inter_agent_depth_exceeded`, non-retryable. Webhooks, agent-created crons and reminders stay depth-0 roots. Event dispatch is also budgeted per source→subscriber by `event_dispatch_max_fires_per_hour` (120).
+- **Events**: `{{payload.*}}` values in subscriber prompts are credential-sanitized, clamped to 4000 characters and framed as data (#3104); an emit payload over 64 KiB is a 422; `GET /api/events` is scoped to the caller's accessible agents (#3040). Withdrawing a permission edge stops event delivery on the next event and drops the `shared-in/*` mount on the agent's next start (ent#739).
+- **Host header** (#3102): scope fences compare the routed path, and a `Host` containing `/ ? # \ @`, whitespace or control characters gets HTTP 400 `Invalid Host header`. A normal `host[:port]` from a reverse proxy is unaffected. The `ops` route fence itself is unchanged.
+- **Sign-in email** (ent#720): binding an address is `POST /api/users/me/email/code` then `PUT /api/users/me/email {email, code}`; 409 `email_in_use`, 429 `too_many_codes` / `too_many_attempts`. With no mail provider configured, only an interactive admin may bind without a code (audited `email_bind_unverified`).
+- **Open findings worth knowing** (`docs/security-reports/cso-2026-09-30.md` on the server): the prod and hosted compose files publish 8000, 8080, Vector 8686 (unauthenticated) and the OTel ports on all interfaces, and the container firewall ships only with `--provision`, so firewall a hand-run host yourself; the default `TRUSTED_PROXIES` covers the agent network; `POST /api/operator-queue/clear-resolved` is still agent-callable.
+
+### Peer skill grants and agent-key reach (v1.0.0, ent#662 / ent#629 / ent#872)
+
+- **Peer skills.** An `agent_permissions` edge lets the caller run the skills the target **declares itself**. A library-assigned skill needs a row in `agent_peer_skill_grants` (`caller_agent`, `target_agent`, `skill_name`, `granted_by`, `granted_at`), empty after upgrade. Exempt: the agent itself, people, schedules, channels, connectors, `trinity-system`, and a parent calling a child it spawned. A #2914 `conflict` row counts as declared. Grant from Settings → Agents (drift list, Grant button) or the API under [API Access](#api-access); refusal 403 `skill_not_granted`, audited `peer_skill_refused`, 503 `peer_surface_unavailable` fails closed.
+- **Reach.** An agent key reaches itself, its edge targets and the agents it spawned with its current key, on chat, task, fan-out, loops, A2A inbound, history, logs and git-token routes; anything else is the uniform 404. Manage-tier routes cover only itself and its spawn (an edge never means "may manage"; `skills.manage` keeps owner-wide reach). Fleet routes answer with the key's reach only. Still owner-wide: fleet sync audit and fleet health. `/ws/events` with an agent key is a scoped non-admin client; `POST /api/ws/ticket`, the proactive-share PUT and the system views are person-only; deploying over an agent the caller cannot manage is 403 `NAME_OWNED_BY_ANOTHER_USER`.
+- **Workspace-only `user` role** (ent#837): see upgrade step 0 under [Update Trinity](#update-trinity). An agent owned by a demoted `user` keeps only its own runtime routes; its crons, webhooks and channel bots keep running and only an admin can pause them.
+- **Files, tier per verb** (ent#819 / ent#820 / ent#823, policy `file_path_policy.py` in both the backend and the image). Download/preview of credential-class paths needs the owner or an admin as a person: 403 `owner_tier_path`, audited `file_read_refused` / `file_read_allowed`. Reads never follow a symlink (`resolved_path_mismatch`) or a second hard link (`hardlinked_file`), owner included. Share holders cannot write `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `CLAUDE.local.md`, `.claude/**` or code-running init files (`.bashrc`, `.profile`, zsh init, `.gitconfig`, `.local/bin`, …) and do not see hidden files. Upstream still says "sharing gives full access to the agent's files": share only with people you trust.
+- **Other 1.0 gates.** Credentials export/import (`POST /api/agents/{n}/credentials/{export,import}`) are human-only, and the three credential-migration MCP tools are offered to `user`/`system` keys only (#3435). `/ws/events` refuses a key whose owner is suspended or deactivated (close 4001, ent#858). `workspace-problem-*` rating alerts are owner/admin-only (ent#866). Only an OTP-minted Workspace session may self-approve a gated skill (#3404; older sessions re-sign-in). A skill-gate approver who cannot open the agent is refused (422 `approver_cannot_open_agent`; saving the gate warns `approver_not_shared`, ent#881) — share the agent with the approver. A resume turn no longer hands the agent the responder's email (ent#886).
+- **SSO / email login** (ent#849, #3655): with "keep email-code login" off, `/api/auth/email/{request,verify}` answer 403 `email_code_disabled` and admin `POST /token` stays the break-glass. `GET /api/auth/mode` carries `email_code_login_enabled` and `email_delivery_available`; when no provider is configured the login page says the code is in `docker logs trinity-backend` — configure Resend or SMTP under Settings → Integrations.
+- **AAuth** (ent#623 / #862) ships dark: `AAUTH_ENABLED` unset = off. Discovery documents `/.well-known/aauth-agent.json`, `aauth-jwks.json`, `aauth-resource.json` are public (60/min/IP) once live; the person-token and resource-call prototypes (`POST /api/agents/{n}/aauth/{person-token,resource-call}`) also need `AAUTH_PROTOTYPE_ENABLED` and accept only the agent's own key (403 `aauth_agent_only`). An empty or malformed `AAUTH_RESOURCE_ALLOWLIST` makes no resource callable. `rotate-credential-key.py` also rewraps `aauth_signing_key_encrypted`.
+- **Removed routes** (#3434): `GET /api/observability/{metrics,status}` (use `GET /api/ops/costs`), `GET /api/agents/{name}/activities` and `/api/agents/activities/timeline` (use `GET /api/activities/timeline`), and five unauthenticated `/api/internal/*` routes. Nothing in this runbook used them.
+
 ### Git remotes carry no token (v0.9.5, ent#615 / #2757)
 
 Agents used to store `https://oauth2:<PAT>@host/org/repo.git` as `origin`. That left the platform GitHub token in `.git/config` on the workspace volume. It also put the token in the `git-remote-https` command line on every fetch, including the 60s sync-health poll, so it showed up in `ps`, orphan-sweep logs, Vector, host log files and the logs API.
@@ -984,13 +1238,17 @@ Six `system_settings` credential rows (`anthropic_api_key`, `github_pat`, `googl
 
 A DigitalOcean 1-Click droplet boots with **no admin**: `ADMIN_PASSWORD` is blank and `ADMIN_PASSWORD_SOURCE=browser` (written only by the marketplace image's first `start.sh --hosted`), and the first visitor to `https://<ip>` creates the admin at `/setup`. Anyone who finds the IP first can squat it — an accepted risk (2026-09-10). Mitigations: open it right after creation (~90s first boot), cloud-firewall 443 to your IP until claimed (leave 80 for ACME), or supply the password at create time via `#cloud-config write_files` → `/etc/trinity/admin-password`. A never-opened droplet that shows a **login** page instead of **create admin** was claimed by someone else — destroy and recreate. On a claimed droplet `.env` keeps `ADMIN_PASSWORD` blank on purpose; **forgotten-password recovery** = set `ADMIN_PASSWORD` in `/opt/trinity/.env` and re-run `start.sh --hosted`. `docker-compose.prod.yml` keeps `${ADMIN_PASSWORD:?}` (refuses blank), and the backend 403s a blank-password claim unless the source is `browser` — never set `ADMIN_PASSWORD_SOURCE=browser` on a hand-run install. `/setup` also refuses whenever a usable admin exists (#2385), and `POST /api/auth/email/verify` re-checks the allow-list before redeeming a code.
 
+**Instance-ID claim on AWS (v1.0.0, #3004 / #3083).** `ADMIN_PASSWORD_SOURCE=instance-id` is the AWS answer to the same squatting risk: `/setup` also requires the EC2 instance ID, which provisioning stores in `${TRINITY_DATA_PATH}/setup-claim` (0600, uid 1000, taken atomically and deleted once the admin exists). `GET /api/setup/status` reports `claim_required: "instance-id"`. Someone who finds the IP first cannot claim it without reading the instance ID from your AWS account. `start.sh --provision --cloud aws` sets it automatically when no `ADMIN_PASSWORD` is supplied, and the AWS AMI always uses it. Never set it by hand. The Vultr marketplace script uses `browser`. Since #3237 `/setup` also deploys `trinity-system` in the background once the admin exists; before that a browser-claimed install had no system agent until the next backend restart.
+
 ### Guardrail hooks live outside the agent's reach (ent#345 / #2299)
 
-Guardrail hook registration moved from the agent-writable `~/.claude/settings.json` to root-owned, mode 0444 `/etc/claude-code/managed-settings.json` in the **base image**. `startup.sh` asserts it every boot and logs `GUARDRAILS: registration verified` or `GUARDRAILS: ERROR — … MISSING` / `… WRITABLE by the agent user`; it reports and continues, and in the ERROR state **no hooks run**. A legacy in-tree copy on the home volume is removed only on an exact `cmp` match. Needs the rebuilt base image plus a cold recreate; grep agent logs for `GUARDRAILS:` afterwards. No `/health` signal yet. The `.claude/settings*` entry in [Protected Files](#protected-files) still applies to the API write paths.
+Guardrail hook registration moved from the agent-writable `~/.claude/settings.json` to root-owned, mode 0444 `/etc/claude-code/managed-settings.json` in the **base image**. `startup.sh` asserts it every boot and logs `GUARDRAILS: registration verified` or `GUARDRAILS: ERROR — … MISSING` / `… WRITABLE by the agent user`; it reports and continues, and in the ERROR state **no hooks run**. A legacy in-tree copy on the home volume is removed only when it matches a version the image shipped (an exact `cmp` at v0.9.5, a SHA-256 list since ent#787). Needs the rebuilt base image plus a cold recreate; grep agent logs for `GUARDRAILS:` afterwards. At v0.9.5 there is no `/health` signal.
+
+**v1.0.0 (ent#787 / #3113):** the **agent server's** `/health` (in-container `:8000`, not the backend's) reports `guardrails_registration: ok|missing|not_root_owned|writable`, stat'd on every request, plus `skill_gate_hook` (same values, or `unsupported_runtime`). Nothing in the backend, MCP server or UI reads either field yet, so check by hand: `docker exec agent-x curl -s localhost:8000/health | jq '.guardrails_registration, .skill_gate_hook'`. A sudo rewrite that keeps root:root 0444 still reads `ok`; upstream calls the new sudo deny patterns a speed bump, since `developer` has passwordless sudo. Hooks are now registered in exec form under an isolated interpreter, and read-only mode lives in root-owned `/opt/trinity/read-only-config.json`. The `.claude/settings*` entry in [Protected Files](#protected-files) still applies to the API write paths.
 
 ### Provisioned hosts: firewall, metadata service, and private network access (#2707 / #2522 / #2692)
 
-`start.sh --provision` installs `trinity-docker-firewall.service`, which populates a `TRINITY-FW` chain jumped from `DOCKER-USER`: RELATED/ESTABLISHED return → **DROP** container traffic to `169.254.0.0/16` (the cloud metadata service — a `trinity-do-create.sh` droplet's user-data carries the admin password and Claude token verbatim for the life of the machine, so agents must not be able to read it) → return from `docker0`/`br+` → DROP everything else. Inverted rule: **no Docker-published port is reachable off-box**, whatever the port; Caddy on 80/443 is the only public surface. IPv4 only; re-applied on every boot. ufw and `iptables-persistent` must never coexist (apt removes ufw). `GET /api/public/tls-allowed?domain=` is the whole on-demand-TLS security model: it answers 2xx for exactly the host of the saved Public URL and 404 otherwise, failing closed. Only Caddy's own asks record the domain as reached (the latch behind "waiting for the first visit"). A request from anywhere else still gets an answer but changes nothing, so the tick cannot be forged.
+`start.sh --provision` installs `trinity-docker-firewall.service`, which populates a `TRINITY-FW` chain jumped from `DOCKER-USER`: RELATED/ESTABLISHED return → **DROP** container traffic to `169.254.0.0/16` (the cloud metadata service — a `trinity-do-create.sh` droplet's user-data carries the admin password verbatim for the life of the machine, plus the Claude token when created by the v0.9.5 script, and on AWS the same address serves instance-role credentials, so agents must not be able to read it) → return from `docker0`/`br+` → DROP everything else. Inverted rule: **no Docker-published port is reachable off-box**, whatever the port; Caddy on 80/443 is the only public surface. IPv4 only; re-applied on every boot. ufw and `iptables-persistent` must never coexist (apt removes ufw). `GET /api/public/tls-allowed?domain=` is the whole on-demand-TLS security model: it answers 2xx for exactly the host of the saved Public URL and 404 otherwise, failing closed. Only Caddy's own asks record the domain as reached (the latch behind "waiting for the first visit"). A request from anywhere else still gets an answer but changes nothing, so the tick cannot be forged.
 
 **Private network (VPN-only) access (#2692):** `PRIVATE_NETWORK_CIDRS` in `.env` is a space-separated list of CIDRs, for Tailscale `"100.64.0.0/10 fd7a:115c:a1e0::/48"`. It makes Caddy serve **plain HTTP** to connections *from* those ranges. Everyone else is still redirected to HTTPS. Without it, a VPN-only instance has shell access but no URL to browse: sites are matched by hostname, and a tailnet address can never get a public certificate.
 - The match is on the **connection's source address**, never a header, and `0.0.0.0/0` or `::/0` is refused.
@@ -1019,6 +1277,8 @@ Requires `INTERNAL_API_SECRET` — the mcp-server relays login and the resulting
 ### Outbound A2A is a trust decision (Issue #736)
 
 `A2A_OUTBOUND_ENABLED` turns on the platform's first backend-executed, credentialed, agent-triggerable outbound fetcher. The design bounds it — agents pick a target by **name** from an admin-registered list and can never supply a URL, and stored credentials are never returned by any read — but registering an endpoint grants the remote a channel back into the calling agent: a cooperating remote can return its own payload, and no sanitiser can stop a transformed secret. Register only endpoints you would trust with the agent's context.
+
+**Trusted networks are outbound-only (v1.0.0, ent#838 → ent#885).** `PUT /api/settings/a2a-trusted-networks` (body `{"entries": [...]}`) lets a registered outbound endpoint be private, CGNAT or plain `http://` when its host is listed, re-checked on every call (`endpoint_not_https` / `endpoint_private_address` otherwise). The keyless inbound mode that shipped on the `-aws.N` pre-release was removed before 1.0: **every inbound A2A call needs a credential**, `a2a_scope` / `a2a_keyless_internal` / `source_host` are inert, and `A2A_PROXY_HOSTS` no longer exists. Setting an agent's exposure is still the entitled route. A bearer `tasks/get` / `tasks/cancel` answers only for a task the **same user and key** started over A2A (#3751); a long `message/send` returns a `working` task after ~25s instead of losing the answer to the caller's timeout (#3749). When publishing A2A through a tunnel, anchor the rules (`^/a2a/[^/]+$` and the agent-card path): an unanchored `/a2a/*` also exposes the outbound caller. A priced agent's `POST /a2a/{name}` answers 402 without a payment token (ent#679).
 
 ### Redis ACL (Issue #589)
 
@@ -1075,7 +1335,9 @@ Tickets live in Redis (`trinity-redis`). If Redis is down, WebSocket connections
 ### Protected Files
 
 The following files cannot be written via `PUT /api/agents/{name}/files` or credential inject:
-`.mcp.json.template`, `.credentials.enc`, `.env*`, `.ssh/*`, `.aws/*`, `.gcp/*`, `.claude/settings*`, `.trinity/*`, `.git/*`
+`.mcp.json`, `.mcp.json.template`, `.credentials.enc`, `.env`, `.env.*`, `.ssh/*`, `.aws/*`, `.gcp/*`, `.claude/settings.json`, `.claude/settings.local.json`, `.trinity/*`, `.git/*`, `.gitignore`, `/opt/trinity/*`, `/etc/*` (including `/etc/claude-code/*`), `/proc/*`, `/sys/*`
+
+v1.0.0 (ent#792): a leading `//` no longer slips past the list, and `DELETE /api/agents/{name}/files` applies it too, including any directory that contains a protected path (403 `Cannot delete protected path: …`). For an agent key, `.claude/skills/**` additionally needs `skills.manage` and the rest of `.claude/**`, `CLAUDE.md` and `AGENTS.md` need `instructions.manage`.
 
 ---
 
@@ -1115,6 +1377,11 @@ A new **"High restart count"** / "restarting frequently" operator alert after th
 - **401 with the right password**: `grep ADMIN_USERNAME ~/trinity/.env` — prod compose forwards it since #2385, so a previously inert value is now the real username.
 - **An MCP key 403s on an admin route it used to reach**: scope is not `user`/`system` (#2389); `ops` only reaches its GET allowlist, and an `ops` key whose owner was demoted or suspended is dead — re-mint under a service admin.
 - **`/chat` or `/task` 403 mentioning `X-Source-Agent`**: a non-agent principal is sending that header (ent#614) — remove it.
+- **403 `{"code":"workspace_only"}` after the 1.0 upgrade** (ent#837): the account's platform role is `user`, which is Workspace-only now. Raise it: `PUT /api/users/{username}/role {"role":"operator"}` from an admin JWT session (see upgrade step 0).
+- **An orchestrator's agent key gets 404 or an empty list for a sibling** (ent#629 / ent#872): agent keys reach only themselves, their edge targets and their spawn. Add an `agent_permissions` edge, or move the automation to a `user` key.
+- **403 `skill_not_granted` on an agent-to-agent skill call** (ent#662): the skill is library-assigned on the target. Grant it per pair (`PUT /api/agents/{caller}/peer-skills/{target}/{skill}`, admin JWT) or from the Settings → Agents drift list.
+- **403 `owner_tier_path` / `agent_restart_required` on a file read** (ent#819 / ent#820): the path is credential-class (owner/admin only, as a person), or the agent still runs a pre-1.0 image — rebuild the base image and stop/start it.
+- **Inbound A2A from another instance stopped working after the upgrade** (ent#885): the caller relied on the keyless trusted-network path, which is gone. Give it a key; the trusted list now only governs outbound calls.
 
 ### `start.sh --hosted` fails, or agents stay on the old runtime after a pull
 
@@ -1135,6 +1402,13 @@ A new **"High restart count"** / "restarting frequently" operator alert after th
 - **Cannot reach the UI after joining a tailnet and closing 80/443**: a tailnet address has no certificate and cannot get one. Set `PRIVATE_NETWORK_CIDRS` and run `start.sh --provision --cloud digitalocean --caddy-only`. `http://<tailnet-ip>:8081` is dropped by `TRINITY-FW` by design. An MCP client pointed at `:8080` fails the same way; use `https://<domain>/mcp`.
 - **Telegram / WhatsApp stopped delivering right after saving a Public URL**: saving re-points the webhooks immediately, even if the domain is not live yet. Once the domain loads, **re-save** the Public URL to re-register them. Settings stuck on "saved, waiting for the first visit" means no request has reached that name yet: check the `A` record and that 80/443 are open (a cloud firewall added during the claim window is the usual cause).
 - **`PRIVATE_NETWORK_CIDRS: refusing '0.0.0.0/0'`** / **"Generated Caddyfile is invalid — leaving the running config alone"**: `--caddy-only` refused the value. The site keeps serving on the previous config; fix `.env` and re-run.
+- **`POSTGRES_PASSWORD must be set in .env`** (v1.0.0, #3159): a bare `docker compose -f docker-compose.hosted.yml …` on an upgraded checkout. Run `start.sh --hosted` once; it generates the password.
+- **`the PostgreSQL volume already exists but POSTGRES_PASSWORD is missing from .env`**: the `.env` lost the password that opens `trinity_postgres-data`. Restore the original value from your `.env` backup; a new one cannot open the data.
+- **Hosted upgrade lands on an empty database / `setup_required`**: `grep '^DATABASE_URL' .env` shows no line while `trinity-data/trinity.db` exists, so the stack booted the empty bundled PostgreSQL. Add `DATABASE_URL=` (empty) and re-run `start.sh --hosted`. The SQLite file was never touched.
+- **`trinity-do-create.sh` asked for no Claude token, or agents cannot run after a fresh install**: the v1.0.0 script no longer takes one (#2867). Sign in and finish the **Connect Claude** step. The "That is an API key" refusal exists only in the v0.9.5 script.
+- **`--cloud aws` / `--cloud vultr` rejected**: the checkout is v0.9.5 or older.
+- **AWS: site unreachable after a stop/start**: the public IP changed. `systemctl status trinity-ip-refresh.timer`, `cat /etc/trinity/public-ip`; allow five minutes, or run `start.sh --provision --cloud aws --refresh-ip`. An Elastic IP avoids it. **`/setup` says "That instance ID does not match this server"**: use the `i-…` value from the EC2 console; the claim file is `trinity-data/setup-claim` and is gone once an admin exists.
+- **`trinity-system` never created on a 2-vCPU host**: it asks for 4 CPUs and Docker refused. Fixed by #3184 (limit capped at the host CPU count; grep `[#2318]`).
 
 ### Agent 503s on its first turn / hooks not running / Codex 401s — stale base image
 
@@ -1144,7 +1418,21 @@ All three are image-side fixes in v0.9.5 that need `build-base-image.sh` **plus*
 - **`GUARDRAILS: ERROR — … MISSING / WRITABLE`** in `docker logs agent-x` (#2299): stale image or a tampered `/etc/claude-code`; no guardrail hooks run until rebuilt.
 - **Codex API-key agent 401s every turn** (#2208/#2333): `codex exec` reads `$CODEX_HOME/auth.json`, not env; grep `[Codex] could not write API-key auth.json`.
 - **An agent pegging a CPU in `credential_sanitizer`** (#2398): quadratic key test on the old image, 40s per key.
-- **Playbooks / `/` popup show "No description available"** (#2850): the skill uses Claude Code's comma-separated `allowed-tools: Read, Bash` form, which the old image's scanner rejected, dropping every field. The warning repeats on every `GET /api/skills`.
+- **Playbooks / `/` popup show "No description available"** (#2850): the skill uses Claude Code's comma-separated `allowed-tools: Read, Bash` form, which the old image's scanner rejected, dropping every field. The warning repeats on every skills listing (`GET /api/skills/library`, the agent Skills tab).
+
+v1.0.0 adds four more (already present on the `-aws.N` pre-release), same remedy:
+
+- **Every Gemini turn fails at argument parsing** (#2971), or **`claude-opus-5-5` answers 400 `model_unsupported`** (#3013): the image predates the `gemini-cli@0.62.0` / Claude Code `2.1.281` pins. `docker exec agent-x claude --version` must be ≥ 2.1.280. A refused model is no longer treated as an auth failure, so it stops rotating subscriptions.
+- **Agent container Up but the agent server is dead right after boot, OTEL enabled** (#3106): FastAPI 0.142 auto-telemetry. A recreate alone rescues an old-image agent (the backend injects `OTEL_SDK_DISABLED=true`); the rebuild fixes it properly.
+- **A gated skill runs without approval, or every gated turn fails closed** (ent#752): `docker exec agent-x curl -s localhost:8000/health | jq .skill_gate_hook` should be `ok`. `missing` = old image.
+- **Agent stays behind origin with pull sync on** (ent#703): no `pull loop started` line in `docker logs agent-x` means the old image.
+
+Also fixed image-side in the last 1.0 stretch (after `-aws.2`), same remedy:
+
+- **Credentials you injected revert on every restart** (#3710): the old `startup.sh` copied the template `.env` seed over the workspace `.env`; the 1.0 image only seeds when absent (`Seeding .env if absent...`).
+- **Skills tab shows a gated skill as "not enforced"**: the agent `/health` has no `skill_gate_hook` (`predates`) — old image.
+- **A failed turn says "no diagnostic output — most likely OOM"** for what was really an API error such as content filtering (#3340); concurrent runs show each other's tool output (#3712).
+- **A renamed agent's heartbeat / pull workers 403** (#3813): stop and start it once (cold); a start of a running agent does not repair `AGENT_NAME`.
 
 ### Agent shows "Up" but no request completes (wedged agent server)
 
@@ -1152,19 +1440,22 @@ Issue #2455/#2503 (v0.9.5, image-side). `faulthandler` is armed at agent-server 
 
 ### Executions FAILED with 503 / "queued" rows / watchdog text changed
 
-Issue #904 / #2433 / #2435 (v0.9.5). Outbound agent calls are capped per uvicorn worker by `BACKEND_AGENT_CALL_LIMIT` (8; prod runs 2 workers → 16 fleet-wide). A call over the cap **parks**; since #2435 a parked call is registered in-flight (`execution:inflight:{id}`, 60s TTL) so the watchdog no longer false-fails it, its `started_at` is re-stamped at dispatch (admission kept in `queued_at`) so the park does not spend the run's budget, and it is cancellable (→ `CANCELLED`, never `FAILED`). Waiting past `BACKEND_AGENT_CALL_QUEUE_TIMEOUT_S` (3600; `0` = forever) gives an honest **503 / FAILED** row. Raise the cap on a large fleet with many concurrent schedules; `>5s` queue waits log a warning (`[InflightDispatch]`), and `CleanupReport.dispatch_inflight_skipped` counts withheld rows. The orphan error text is now `Execution not tracked by agent '<name>' (not running, not pending, not recently completed) …` — update any grep for the old `Execution completed on agent but status not reported`. Also: a FAILED row is labelled `TIMEOUT` only when elapsed ≥ limit − 30s (#2752; earlier transport timeouts get `NETWORK` with the real cause); watchdog-swept rows record `duration_ms = NULL` instead of a fabricated value (#2434 — a >24.8-day value used to overflow PG `int4` and roll back the **whole** sweep batch, freezing every stale row fleet-wide while logging success; the upgrade boot self-heals it); `QUEUED` as a non-terminal status appears only for agents in `PULL_MODE_PILOT_AGENTS` (#2513).
+Issue #904 / #2433 / #2435 (v0.9.5). Outbound agent calls are capped per uvicorn worker by `BACKEND_AGENT_CALL_LIMIT` (8; prod runs 2 workers → 16 fleet-wide). A call over the cap **parks**; since #2435 a parked call is registered in-flight (`execution:inflight:{id}`, 60s TTL) so the watchdog no longer false-fails it, its `started_at` is re-stamped at dispatch (admission kept in `queued_at`) so the park does not spend the run's budget, and it is cancellable (→ `CANCELLED`, never `FAILED`). Waiting past `BACKEND_AGENT_CALL_QUEUE_TIMEOUT_S` (3600; `0` = forever) gives an honest **503 / FAILED** row. Raise the cap on a large fleet with many concurrent schedules; `>5s` queue waits log a warning (`[InflightDispatch]`), and `CleanupReport.dispatch_inflight_skipped` counts withheld rows. The orphan error text is now `Execution not tracked by agent '<name>' (not running, not pending, not recently completed) …` — update any grep for the old `Execution completed on agent but status not reported`. v1.0.0 (#2947) the agent retains each turn's terminal under `~/.trinity/retained-results/` (6h, 50 files) and the watchdog claims it after a backend restart instead of failing the row: the orphan text gains `, no retained result`, and a recovered row logs `[Watchdog] retained`. Needs the rebuilt base image. Two new refusals in the same area: **403 `inter_agent_depth_exceeded`** (an agent-to-agent chain passed `inter_agent_max_chain_depth`, default 8; raise it with `PUT /api/settings/ops/config` if the chain is legitimate) and, on pull-pilot agents only, **422 `effect_unguarded`** (an outbound effect without an execution id, i.e. an old image without the `X-Trinity-Execution-Id` header; alert prefix `effect-unguarded-`). A sync chat whose result is `is_error` is now 502 / FAILED rather than a success carrying partial text (#3153), and a failed async run no longer replays its idempotency receipt (#3245). Also: a FAILED row is labelled `TIMEOUT` only when elapsed ≥ limit − 30s (#2752; earlier transport timeouts get `NETWORK` with the real cause); watchdog-swept rows record `duration_ms = NULL` instead of a fabricated value (#2434 — a >24.8-day value used to overflow PG `int4` and roll back the **whole** sweep batch, freezing every stale row fleet-wide while logging success; the upgrade boot self-heals it); `QUEUED` as a non-terminal status appears only for agents in `PULL_MODE_PILOT_AGENTS` (#2513).
 
 ### Skills source sync red / operator-queue flood from `_skills-sync`
 
-- **`refusing tag 'v0.2.0' … pinned tag must not move`** in `GET /api/skills/sources` `last_error`: on a build before #2551 this is an annotated-tag false positive — update. On a current build the tag really moved: `PUT /api/skills/sources/{id}` with a new `ref`, then `POST …/sync`. The bundled catalog pin is `trinity-skills v0.2.0` for **fresh installs only** (`TRINITY_DEFAULT_SKILL_SOURCE_REF`); existing instances keep their row.
+- **`refusing tag 'v0.2.0' … pinned tag must not move`** in `GET /api/skills/sources` `last_error`: on a build before #2551 this is an annotated-tag false positive — update. On a current build the tag really moved: `PUT /api/skills/sources/{id}` with a new `ref`, then `POST …/sync`. The bundled catalog pin is `trinity-skills v0.2.0` at v0.9.5 and `v0.5.0` at v1.0.0 (#3123 / #3430), for **fresh installs only** (`TRINITY_DEFAULT_SKILL_SOURCE_REF`); existing instances keep their row. v0.3.0 drops `add-backlog`, `add-project-management`, `add-canon` and `add-orchestrator` and adds `update-dashboard`; v0.4.0 / v0.5.0 add `project-status` / `update-status`. Since v1.0.0, `POST /api/skills/sources/apply` registers-or-updates a source keyed on its URL (`url` required; `name`, `ref`, `ref_type`, `enabled`, `priority`; 201 created / 200 updated|unchanged / 409 `ambiguous_source`; admin, agent keys rejected) and backs the `register_skill_source` MCP tool.
 - **"Legacy skills-library adoption refused" items piling up**: before #2777 the refusal filed one row per *sync*; now one per refused URL. A steady-state `low` item means a lingering `skills_library_url` row — add that repo as a source, then delete `skills_library_url` / `skills_library_branch` from `system_settings`. Matching is by normalised repo since #2764.
-- **Assigned skill missing from the `/` popup**: the assign response now carries `delivery.status` (`injected|partial|pending_start|in_progress|not_delivered`, #2704) — `pending_start` = agent stopped; `not_delivered` / `docker_unavailable` → check `DOCKER_GID`.
+- **Assigned skill missing from the `/` popup**: the assign response now carries `delivery.status` (`injected|partial|pending_start|in_progress|not_delivered`, #2704) — `pending_start` = agent stopped; `not_delivered` / `docker_unavailable` → check `DOCKER_GID`. v1.0.0 adds `conflict` (#2914): the agent already has its own `.claude/skills/<name>/`, which a library skill never overwrites and a manual Sync does not override; rename or remove the agent's copy. `POST /api/agents/{name}/start` now returns `skills_injection` / `skills_result` (#2991), and a deprecated library skill still assigns but carries `delivery.skills[name].warnings` (ent#672).
+- **Skill assignment by an agent 403s with `skill_management_not_permitted`** (v1.0.0, ent#596): the calling agent has no `skills.manage` grant, which it needs even for its own skills. See [Self-change grants](#self-change-grants-and-person-only-routes-v100-ent164--ent596--2996).
 
 ### Operator answered an ask, nothing happened / subscription tile says LIMIT but agents work
 
-- `GET /api/agents/{name}/operator-resume` — the answer-wakes-parked-agent hook is off by default (#2312); `PUT {"enabled": true}` (costs a run per answer). An approval `respond` rejected with **422** and a list: send one of `offered_options` verbatim (#2376).
+- `GET /api/agents/{name}/operator-resume` — the answer-wakes-parked-agent hook is off by default (#2312); `PUT {"enabled": true}` (costs a run per answer). An approval `respond` rejected with **422** and a list: send one of `offered_options` verbatim (#2376). On v1.0.0 a **403 `person_required`** means the caller is not a person (use a JWT or the person's own `user` key), and a **409 `item_diverged`** means the agent's file copy changed since it was filed.
+- **An agent's ask vanished or reads `replaced` / `withdrawn`** (v1.0.0): agents can now replace one of their own pending asks (`ask_operator` with `replaces`, Alembic `0097`; 409 `replaces_ended`, 409 `already_pending` for an identical pending approval) or withdraw one (`withdraw_ask`, `POST /api/agents/{name}/operator-queue/{request_id}/withdraw`, self only; no wake-up). An expired non-gate approval reads "Expired — whether the action went ahead is unknown" (`disposition_reason='outcome_unknown'`, ent#844). Pending lists sort oldest first (#3679).
 - Subscription "limit" with working agents: read `auth_failures_24h` / `token_status` on `GET /api/agents/subscription-pressure` — since #2354 an auth failure is not a rate limit; fix the token and `POST /api/subscriptions/{id}/usage/refresh`. Agents restarting after you registered a subscription on an instance without `ANTHROPIC_API_KEY` is the expected #2741 adoption wave. The reverse, where an exhausted subscription reads ~1% used and auto-switch *prefers* it, was the #2419 parse bug. After upgrading, the first sweep may file critical `_sub-headroom` items for every over-limit subscription. A reading above 100% logs the raw header at INFO.
 - **A long turn killed at exactly 300s right after a subscription switch** (`stop_reason=tool_use`, billed, discarded): fixed by #2789. The SUB-003 auto-retry now gets the turn's *remaining* `execution_timeout_seconds` instead of the 300s reader-race ceiling. A clamped retry budget is logged at WARNING. A retry that used its whole allowance is no longer mislabelled `NETWORK`.
+- **"Reached its usage limit" while other subscriptions had headroom** (#3470, v1.0.0): SUB-003 now walks **every** subscription, then the platform API key, re-issuing the same execution with a per-spawn credential; the assignment is kept and the container is not restarted. A refused key is skipped for 2h (auth/billing) or 5 min (429). Grep `\[#3470\]` in the backend log; `did not apply the per-spawn credential (image predates it)` means a pre-1.0 agent image (falls back to commit-and-retry).
 - **Workspace mic missing, or voice input fails** (#2695/#2696): the mic only renders when the ElevenLabs key actually has `speech_to_text` permission. `/stt` now returns a classified error: 503 for permission/auth/quota (operator action needed), 429 for rate limit, 422 for unreadable audio, 502 for provider errors. `GET /api/settings/elevenlabs` (admin) carries `stt_last_failure` (status word + category, 24h), which Settings → Voice also shows.
 - **Chat/task 422 naming the `model` value** (#2796): the request's `model` matched no known family (see [API Access](#api-access)). Send a blank value to use the platform default.
 - A room that died at N/N and cannot be reopened: `GET /api/enterprise/room-budget-defaults`, raise via PUT (human admin token) — the existing room stays closed. `set_canvas` 409 "already has 100 canvases": `clear_canvas` / bulk-delete, or raise `CANVAS_MAX_PER_AGENT` and `compose up -d`.
@@ -1199,10 +1490,12 @@ Restore the original secret if it was changed; recreating the agent containers r
 ./scripts/run.sh "df -h /"
 ./scripts/run.sh "sudo docker system df"
 
-# Clean unused Docker resources (dry run first)
-./scripts/run.sh "sudo docker system prune --dry-run"
-./scripts/run.sh "sudo docker system prune -f"
+# Reclaim images and build cache — safe, touches no container
+./scripts/run.sh "sudo docker image prune -f"
+./scripts/run.sh "sudo docker builder prune -f"
 ```
+
+**Do not reach for `docker system prune` on a Trinity host.** It removes every *stopped* container, and a stopped agent's container is how Trinity knows the agent exists: the workspace volume survives, but the agent drops out of the roster until it is recreated. `--volumes` deletes agent workspaces outright. Run it only when every agent you want to keep is running, and never with `--volumes`.
 
 ### Out of memory
 
@@ -1253,6 +1546,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 Fix the sync failure (or toggle the flag off via `PUT` on the same endpoint) and schedules resume.
 
+**Second freeze trigger and a verdict endpoint (v1.0.0, ent#706).** Red and frozen are no longer the same thing:
+
+- **State** is `green | yellow | red | unknown`. Red: the last sync failed (even once), a work agent diverged or dirty for more than 24h, or auto-sync on with no heartbeat for 7 days. Yellow: a work agent diverged for 24h or less, or a deployment diverged at any age. A work agent is one that pushes (`source_mode=0` or `auto_sync_enabled=1`).
+- **Freeze** needs the flag on **and** either the old rule (3 consecutive failed polls, ~180s) or a work agent diverged from origin for more than 24h with an observation under 15 minutes old.
+- A frozen run is skipped with a `skip_reason` such as `Git sync frozen: diverged 0 behind / 7 ahead for 26h`, and one `sync-diverged-<agent>-<diverged_since>` operator-queue item is filed per episode under the agent. It does not auto-resolve.
+- Ask `GET /api/agents/{name}/git/sync-state` rather than `git/status`: it returns `state`, `reason`, `recommendation`, `freeze` and `freeze_cause`. Fix by pushing, pulling, or enabling auto-sync.
+- A failing **pull** never turns the agent red by itself; it shows only in the pull columns of `sync-state` and in `docker logs agent-x | grep -E 'pull( loop)?:'`. The pull never runs while an execution is running or queued (`skipped`, `execution in flight`). Writes made through the Files API, the web terminal or `docker exec` during the integrate window can be lost.
+- `refused: source-mode on main` in the sync error means auto-sync is on for a deployment: turn auto-sync off. A `Git token can't push` item (`cause=push_denied`) means the token lacks Contents: write and will not recover on its own.
+- Existing agents are **not** moved to a working branch, and retrofitting one is not supported yet. Do not hand-edit `source_mode`. Runbook on the server: `docs/migrations/AGENT_WORKING_BRANCH_DEFAULT_2026-09.md`.
+
 **Sync-health timing and load (#2742, v0.9.5):** the poller now runs on **one** uvicorn worker, holding a Redis lease on `synchealth:leader`. Each failed poll increments `consecutive_failures`, so `sync_failing` now appears after **~180s** instead of ~90s. If Redis is down, every worker polls, as before. Each poll runs a credentialed `git fetch` in every git-enabled agent. On a large fleet, raise `SYNC_HEALTH_POLL_INTERVAL_SECONDS` (default 60; the agent heartbeat only writes every 900s). The agent-side status read no longer takes `.git/index.lock`, so the "silent commit failures from an orphaned 0-byte `index.lock`" class needs the rebuilt base image. Leftover locks are reaped at boot (with a log line); at runtime they are only reported, never deleted. On **PostgreSQL**, an agent whose `.git` is over 2 GiB failed every sync-state upsert with `integer out of range` until Alembic `0063` (#2800).
 
 ### Git fetch/push fails, or an ent#615 token-scrub alert after upgrade
@@ -1297,7 +1600,7 @@ Since v0.9.0 (#2146 / #1833 / #1834) the guard **refuses instead of raising** on
 
 ### Long-running agent task killed at 60min
 
-Default execution timeout was bumped 15min → 60min (#665). The deadline is now the **per-agent** `execution_timeout_seconds` (clamped by the schedule cap, #929) — the scheduler honors it (#913 / #922). The old **per-task `timeout_seconds` override is deprecated** (#1068): still honored-but-clamped this release, removed in a follow-up. To extend the wall, raise the agent's `execution_timeout_seconds` (Agent Detail → Settings, or `PATCH /api/agents/{name}`) rather than passing a per-task override. **Workspace chat turns** honour the same per-agent timeout since v0.9.0 (#2214) — before that they were hard-capped at 300s regardless of the agent's setting.
+Default execution timeout was bumped 15min → 60min (#665). The deadline is now the **per-agent** `execution_timeout_seconds` (clamped by the schedule cap, #929) — the scheduler honors it (#913 / #922). The old **per-task `timeout_seconds` override is deprecated** (#1068): still honored-but-clamped this release, removed in a follow-up. To extend the wall, raise the agent's `execution_timeout_seconds` (Agent Detail → Settings, or `PUT /api/agents/{name}/timeout` with `{"execution_timeout_seconds": 60-7200}`; on v1.0.0 a person or an `agents.manage` holder) rather than passing a per-task override. **Workspace chat turns** honour the same per-agent timeout since v0.9.0 (#2214) — before that they were hard-capped at 300s regardless of the agent's setting.
 
 ### Fan-out turn recorded SUCCESS but the subagents' work is missing
 
@@ -1437,7 +1740,11 @@ Fix: update to v0.9.0 — the new `trinity-archives-init` one-shot chowns the vo
 
 ### Operator-queue items from `_db-backup` / `_log-archive`
 
-Those are not agents. Platform maintenance jobs file their alarms directly (bypassing the #1632 agent-ingestion caps by construction) under uncreatable sentinel names — `_db-backup` (#2216), `_log-archive` (#2205), `_sub-headroom` (subscription headroom alarms, ent#434), `_skills-sync` (legacy skills-library adoption refusals, #2777) — plus the reserved id prefixes `db-backup-`, `log-archive-`, `alert-budget-`, `sub-headroom-`, `skills-legacy-adoption-`, `role-drift-` — so an agent can neither pre-create nor silence them. New item types in v0.9.5: `workspace_problem_report` (a client's thumbs-down with a report, ent#498) and `portal-inbox-collision-<dir>`. The ent#615 git token-scrub alerts (`ent615-git-token-scrub-[unreadable-]<agent>-<date>`) are **not** sentinel items: they are filed under the affected agent's own name. See [Git fetch/push fails](#git-fetchpush-fails-or-an-ent615-token-scrub-alert-after-upgrade). Responding to one authorizes nothing; it is a pointer to the runbook entries above. Related: platform alert emitters that an *agent* can influence (e.g. the unknown-slash-command alert) are now depth-budgeted per (agent, type) by `OPERATOR_ALERT_MAX_PENDING_PER_TYPE` (#1677, default 5) — at the cap you get one cooldown-gated `alert-budget-<agent>-<type>` episode item instead of a flood.
+Those are not agents. Platform maintenance jobs file their alarms directly (bypassing the #1632 agent-ingestion caps by construction) under uncreatable sentinel names — `_db-backup` (#2216), `_log-archive` (#2205), `_sub-headroom` (subscription headroom alarms, ent#434), `_skills-sync` (legacy skills-library adoption refusals, #2777), `_retention-guard` (prune refusals, #1644) — plus the reserved id prefixes `db-backup-`, `log-archive-`, `alert-budget-`, `sub-headroom-`, `skills-legacy-adoption-`, `role-drift-`, `retention-guard-`, `skills-reconcile-`, `skills-fleet-reinject-`, `portal-inbox-collision-`, `ent615-git-token-scrub-` and, on v1.0.0, `sync-diverged-`, `effect-unguarded-` and `gate-` (platform-raised skill-gate asks) — so an agent can neither pre-create nor silence them. New item types in v0.9.5: `workspace_problem_report` (a client's thumbs-down with a report, ent#498) and `portal-inbox-collision-<dir>`. The ent#615 git token-scrub alerts (`ent615-git-token-scrub-[unreadable-]<agent>-<date>`) are **not** sentinel items: they are filed under the affected agent's own name. See [Git fetch/push fails](#git-fetchpush-fails-or-an-ent615-token-scrub-alert-after-upgrade). Responding to one authorizes nothing; it is a pointer to the runbook entries above.
+
+**Platform alerts are conditions on v1.0.0 (#3246 / #2372).** There is one pending row per `(agent, subject)`: a repeated reading bumps `last_seen_at` and `context.seen_count` instead of filing another row, so the floods described elsewhere in this file collapse to one item. The platform ends an alert itself when the condition clears (`cancelled`, `disposed_by=platform`, reason `condition_cleared`); otherwise it expires `OPERATOR_PLATFORM_ALERT_LIFETIME_DAYS` (14) after its last reading. Answering one still authorizes nothing, but it now **ends** the item (`status='acknowledged'`) and the same reading files nothing for `OPERATOR_PLATFORM_ALERT_SNOOZE_DAYS` (7) unless its priority rises or a material field changes. Only four emitter families are on this seam so far (`sub-headroom`, `skills-legacy-adoption`, `base-image-stale`, `cb-dormant`). The queue flood alert is now one per over-cap episode, and platform rows no longer count toward an agent's depth cap (#3130).
+
+**Agents raise asks natively now (ent#611).** `ask_operator` / `get_my_ask` (`POST` / `GET /api/agents/{name}/operator-queue[/{request_id}]`, self-acting only) replace the `~/.trinity/operator-queue.json` file, which is deprecated and kept for two releases; the backend logs the deprecation on first ingest per agent. An over-limit native ask is a 422; an over-limit file entry is held and listed under a `platform.ingestion` block written back into the agent's file (limits: `OPERATOR_QUEUE_MAX_OPTIONS` and siblings). A pending item older than `operator_queue_aging_hours` (24) is marked as aging. Related: platform alert emitters that an *agent* can influence (e.g. the unknown-slash-command alert) are now depth-budgeted per (agent, type) by `OPERATOR_ALERT_MAX_PENDING_PER_TYPE` (#1677, default 5) — at the cap you get one cooldown-gated `alert-budget-<agent>-<type>` episode item instead of a flood.
 
 ---
 
@@ -1472,11 +1779,11 @@ Those are not agents. Platform maintenance jobs file their alarms directly (bypa
 |----------|----------|---------|
 | `ADMIN_PASSWORD` | **Yes** | Admin login (12+ chars; no sensible default — operator must set). Blank is legal ONLY with `ADMIN_PASSWORD_SOURCE=browser` (marketplace images) |
 | `ADMIN_USERNAME` | Optional (default `admin`) | Admin username. **Forwarded by prod compose since v0.9.5 (#2385)** — before that it was inert there and the backend provisioned `admin` regardless. This agent's `POST /token` must use the same value |
-| `ADMIN_PASSWORD_SOURCE` | Marketplace images only (ent#580) | `browser` = no admin until the first visitor claims `/setup`; written by the 1-Click image's first `start.sh --hosted`, forwarded by the hosted compose only. **Leave unset** on every hand-run install — see [Browser admin claim](#browser-admin-claim-on-marketplace-images-ent580--2715) |
+| `ADMIN_PASSWORD_SOURCE` | Marketplace images and AWS installs only (ent#580, #3004) | `browser` = no admin until the first visitor claims `/setup`; written by the 1-Click image's first `start.sh --hosted` and by the Vultr first-boot script. `instance-id` (v1.0.0) = `/setup` also demands the EC2 instance ID; written by `start.sh --provision --cloud aws` when no password is supplied. Forwarded by the hosted compose only. **Leave unset** on every hand-run install — see [Browser admin claim](#browser-admin-claim-on-marketplace-images-ent580--2715) |
 | `SECRET_KEY` | **Yes** (auto-gen) | JWT signing — generated by `start.sh` if blank |
 | `CREDENTIAL_ENCRYPTION_KEY` | **Yes** (auto-gen) | Encrypt stored tokens; loss = unrecoverable credentials. Since v0.9.5 also wraps the six platform credential rows in `system_settings` (ent#435) and the backend **refuses to boot** without it when such rows exist |
 | `TRINITY_IMAGE_TAG` | Hosted installs (#2280, default `latest`) | Which published GHCR image set `start.sh --hosted` / `docker-compose.hosted.yml` pulls (platform images + agent base). **Pin it** — `latest` moves on every release, so unpinned the next `start.sh --hosted` is an unscheduled upgrade. Pre-release tags never move `latest`. Ignored by source builds |
-| `TRINITY_INSTALL_SOURCE` | Set by provisioning only (#2380, default empty) | Install provenance: `do-marketplace` \| `vultr-marketplace` \| `do-script` \| `script`. Read **once at first boot** into `system_settings` (write-once; the API refuses to change it; an unrecognised value records nothing so a corrected marker still lands next boot). Gates the first-run "Secure this instance" hardening card on marketplace/`do-script` installs only — never on TLS state. Bare passthrough in all compose files. Surfaced on `/api/version` and `/api/settings/feature-flags` |
+| `TRINITY_INSTALL_SOURCE` | Set by provisioning only (#2380, default empty) | Install provenance: `do-marketplace` \| `vultr-marketplace` \| `do-script` \| `script`, plus `aws-marketplace` \| `aws-script` on v1.0.0 (the hardening card shows for the marketplace sources, `do-script` and `aws-script`). Read **once at first boot** into `system_settings` (write-once; the API refuses to change it; an unrecognised value records nothing so a corrected marker still lands next boot). Gates the first-run "Secure this instance" hardening card on marketplace/`do-script` installs only — never on TLS state. Bare passthrough in all compose files. Surfaced on `/api/version` and `/api/settings/feature-flags` |
 | `FRONTEND_PORT` | Optional (default 80) | Host port for the frontend. **Honoured by prod/hosted since v0.9.5** (#2390; was hard-coded `80:8080`). `--provision` sets 8081 so Caddy owns 80/443 |
 | `PRIVATE_NETWORK_CIDRS` | Optional (#2692, default empty) | Space-separated CIDRs allowed to reach Trinity over **plain HTTP** on a `start.sh --provision` host, e.g. Tailscale `"100.64.0.0/10 fd7a:115c:a1e0::/48"`. Matched on the connection's source address; `0.0.0.0/0` and `::/0` are refused, and tokens that are not CIDRs are skipped with a warning. Read **only by `start.sh`** when it renders the Caddyfile, never by a container, so apply a change with `sudo ./scripts/deploy/start.sh --provision --cloud digitalocean --caddy-only`. Empty means every HTTP request redirects to HTTPS. See [Provisioned hosts](#provisioned-hosts-firewall-metadata-service-and-private-network-access-2707--2522--2692) |
 | `COMPOSE_PROFILES` | Optional | Compose reads it from `.env`; `start.sh --hosted` writes `tunnel` here when `TUNNEL_TOKEN` is set. `cloudflared` starts under no other condition |
@@ -1504,9 +1811,9 @@ Those are not agents. Platform maintenance jobs file their alarms directly (bypa
 | `CANARY_ENABLED` | Staging/dev | Run 5-min invariant watcher loop (default 0). **Now forwarded by `docker-compose.prod.yml` (#1876)** — before that the knob was inert in prod, so the watcher was un-enableable on the very instance it exists to watch. One cycle per fleet, not one per uvicorn worker (#1881) |
 | `CANARY_SLACK_WEBHOOK_URL` | Optional | Slack webhook for canary green→red transitions |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Optional | OpenTelemetry collector endpoint |
-| `DATABASE_URL` | Optional (#300) | DB selector. Unset/empty → SQLite at `/data/trinity.db`; `postgresql://…` → PostgreSQL. Prod ships no bundled DB — point at a managed Postgres. See [Database Backend](#database-backend-sqlite-default--postgresql-300) |
+| `DATABASE_URL` | Optional (#300) | DB selector. Dev and prod: unset/empty → SQLite at `/data/trinity.db`; `postgresql://…` → PostgreSQL. Prod ships no bundled DB — point at a managed Postgres. **Hosted on v1.0.0 (#3159): no line → the bundled PostgreSQL; `DATABASE_URL=` (empty) → SQLite.** `start.sh --hosted` writes the right one; never delete the line by hand. See [Database Backend](#database-backend-sqlite-default--postgresql-300) |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | PostgreSQL only | Pool size (10) / burst overflow (20). Ignored on SQLite |
-| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | dev `postgres` profile | Bundled `trinity-postgres` creds. `POSTGRES_PASSWORD` required when the profile is enabled; must match the password in `DATABASE_URL` |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | dev `postgres` profile · hosted (v1.0.0) | Bundled `trinity-postgres` creds. Dev: `POSTGRES_PASSWORD` required when the profile is enabled; must match the password in `DATABASE_URL`. Hosted (#3159): DB and user are fixed at `trinity`, and `POSTGRES_PASSWORD` is **required for the compose file to render**, even on an install that stays on SQLite; `start.sh --hosted` generates it (`openssl rand -hex 24`). It is the only password that opens an existing `trinity_postgres-data` volume — back it up with `.env` |
 | `VOIP_ENABLED` | Optional (VOIP-001 / #1056) | Outbound phone calls via Twilio Media Streams over Gemini Live. Default OFF; per-agent `voip_bindings` still required to place calls. `VOIP_MAX_CALL_DURATION`/`VOIP_DEFAULT_DAILY_CALL_CAP`/`VOIP_CALL_RATE_LIMIT`/`VOIP_CALL_RATE_WINDOW`/`VOIP_*_TTL_SECONDS` are spend/abuse controls |
 | `VOICE_ENABLED` / `VOICE_MODEL` | Optional (VOICE-001) | Voice chat over Gemini Live (default ON). Leave `VOICE_MODEL` commented — an empty value shadows the default and breaks voice (#1076) |
 | `WORKSPACE_ENABLED` | **Retired in v0.9.5** (#2836) | Read by nothing and removed from every compose file and `.env.example`; delete it from `.env`. ent#438 merged the surface it gated into the Workspace (client portal, #2084), which is OSS core, always on, and has no enable flag; its knobs are the `PORTAL_*` vars |
@@ -1536,7 +1843,7 @@ Those are not agents. Platform maintenance jobs file their alarms directly (bypa
 | `VITE_BUG_REPORTING_ENABLED` / `VITE_BUG_INTAKE_URL` | Optional (#1116/#1489) | Frontend **build-time** (baked into the world-readable client bundle — rebuild the frontend image to apply; never put a secret in a `VITE_*` var). In-app bug/feedback widget on/off (default true) and its intake endpoint (default `intake.abilityai.dev`). Repointing the URL also needs a CSP `connect-src` change (nginx + vite config) |
 | `DISPATCH_BREAKER_ENABLED` | Optional (#526/#1487, default false) | GLOBAL gate for the per-agent dispatch circuit breaker that fast-fails NEW executions (503) when an agent is auth-dead instead of poisoning the backlog. Two-tier: this flag AND the per-agent toggle (`PUT /api/agents/{name}/circuit-breaker`) must BOTH be on — with this off, the per-agent toggle no-ops |
 | `REMINDER_MESSAGE_MAX_CHARS` / `REMINDER_MIN_DELAY_SECONDS` / `REMINDER_MAX_DELAY_SECONDS` / `MAX_PENDING_REMINDERS_PER_AGENT` / `MAX_REMINDERS_PER_AGENT_PER_DAY` / `REMINDER_RATE_LIMIT` | Optional (#1296) | Agent self-reminder caps: message 4000 chars, fire window 60s–30d, 25 pending + 100/day per agent, 30 `set_reminder` calls/agent/60s. All have working code defaults |
-| `OPERATOR_QUEUE_*` (15 caps: `_MAX_PENDING_PER_AGENT`, `_CREATE_RATE_LIMIT`/`_WINDOW`, `_FLEET_CREATE_RATE_LIMIT`, `_MAX_SCAN_PER_CYCLE`, `_MAX_FILE_BYTES`, `_TITLE_MAX`, `_QUESTION_MAX`, `_CONTEXT_MAX_BYTES`, `_OPTIONS_MAX_BYTES`, `_ID_MAX`, `_EXECUTION_ID_MAX`, `_EMAIL_MAX` (320, ent#364 addressee email clamp), `_FLOOD_ALERT_COOLDOWN_SECONDS`) | Optional (#1632) | Ingestion caps bounding a compromised/runaway agent flooding `~/.trinity/operator-queue.json` — depth (25 pending/agent), rate (60/agent + 300/fleet per 60s), file-size (2 MB skip), field-size truncation, one flood alert per agent per 5 min. Generous by design: cap abuse, not use |
+| `OPERATOR_QUEUE_*` (14 ingestion caps, plus four ask limits on v1.0.0 (#3243): `_MAX_OPTIONS` 5 (floor 2), `_OPTION_MAX_CHARS` 60 (floor 16), `_ASK_TITLE_MAX_CHARS` 120 (floor 40), `_PROPOSAL_MAX_BYTES` 8192 — a native ask over them is a 422, a file entry is held. The 14: `_MAX_PENDING_PER_AGENT`, `_CREATE_RATE_LIMIT`/`_WINDOW`, `_FLEET_CREATE_RATE_LIMIT`, `_MAX_SCAN_PER_CYCLE`, `_MAX_FILE_BYTES`, `_TITLE_MAX`, `_QUESTION_MAX`, `_CONTEXT_MAX_BYTES`, `_OPTIONS_MAX_BYTES`, `_ID_MAX`, `_EXECUTION_ID_MAX`, `_EMAIL_MAX` (320, ent#364 addressee email clamp), `_FLOOD_ALERT_COOLDOWN_SECONDS`) | Optional (#1632) | Ingestion caps bounding a compromised/runaway agent flooding `~/.trinity/operator-queue.json` — depth (25 pending/agent), rate (60/agent + 300/fleet per 60s), file-size (2 MB skip), field-size truncation, one flood alert per agent per 5 min. Generous by design: cap abuse, not use |
 | `OPERATOR_ALERT_MAX_PENDING_PER_TYPE` | Optional (#1677, default 5) | Per-(agent, alert-type) pending-depth budget for **platform** operator-queue emitters an agent can influence (the #1632 caps only bound the agent-authored *file* seam; direct-DB platform creates were exempt — e.g. an unknown slash-command alert minted one `priority:high` row per distinct command at dispatch throughput). At the cap: one cooldown-gated `alert-budget-<agent>-<type>` episode item; every failure arm fail-closed (suppresses the alert only — the FAILED execution row remains the primary surface) |
 | `PULL_MODE_PILOT_AGENTS` / `MAX_REDELIVERY` | Optional (#1081, default empty / 3) | Pull/work-stealing pilot (dark by default): comma-separated agent names opted into the agent-side pull worker pool. Backend-only process-env — needs a backend restart AND the agent recreated to engage. `MAX_REDELIVERY` = re-deliveries of an expired pull lease before the row is poison-parked to the operator queue |
 | `TRINITY_DEFAULT_SYSTEM_MANIFEST` | Optional (#1764, default empty) | First-run starter-fleet seed: on a genuinely fresh install, Trinity auto-deploys the bundled `config/manifests/default-system.yaml` once after setup. Set to a path (bind-mounted into the backend) for a custom manifest, or `disabled` to skip seeding |
@@ -1545,16 +1852,25 @@ Those are not agents. Platform maintenance jobs file their alarms directly (bypa
 | `AGENT_LOG_MAX_SIZE` / `AGENT_LOG_MAX_FILE` | Optional (#1871, default `10m` / `3`) | Same cap for **agent** containers. Read by the backend at import time, because agents are SDK-created and compose's `logging:` can never reach them. Existing agents adopt a change on **recreate**, not restart |
 | `AGENT_IDLE_FINALIZE_S` | Optional (#2127, blank = agent-side default 300) | How long a headless turn's stdout must be **silent** before the executor may finalize early once a `result` line has been seen and no waited background subagents remain — the third leg of the fix for fan-out turns being killed mid-wait and recorded as success. Set from the longest silence a HEALTHY run produces (~40s measured for a ~10k-char reply, so 300 is ~7×); too LOW silently truncates a finished deliverable, too high only delays lingering-child recovery — bias generous. `<= 0` is refused → default. Baked at create/recreate: existing agents pick up a change on **recreate**, not restart. Only worth lowering for agents with an execution timeout under ~5 min |
 | `A2A_OUTBOUND_ENABLED` | Optional (#736, default false) | Lets an agent task an **external** A2A agent (Google ADK, LangChain, Bedrock, a remote Trinity) — the platform's first backend-executed, credentialed, agent-triggerable outbound fetcher. Also requires ≥1 endpoint registered via `PUT /api/settings/a2a-endpoints`; agents choose a target by **name** and can never supply a URL. A `system_settings` row wins over this var at runtime (no restart) |
+| `AAUTH_ENABLED` / `AAUTH_PROTOTYPE_ENABLED` / `AAUTH_ISSUER` / `AAUTH_PERSON_SERVER` / `AAUTH_RESOURCE_ALLOWLIST` | Optional (ent#623 / #862, v1.0.0; defaults unset / `false` / empty / empty / empty) | Signed AAuth agent identity between instances, **off by default**. Each key resolves `system_settings` row → env → default, and Settings → AAuth (`PUT /api/settings/aauth`, admin JWT) edits the row, so the switch is live without a restart. Live only when enabled **and** `AAUTH_ISSUER` is a valid `https://<host>`. The prototype flag gates the person-token and resource-call routes; an empty or malformed allowlist makes no resource callable. Forwarded by all three compose files |
 | `MCP_A2A_TIMEOUT_MS` | Optional (#736, default 40000) | mcp-server-only ceiling for outbound-A2A fetches. Must stay **below** the MCP client's 30–60s gateway abort: if the gateway gives up first, the agent sees `fetch failed` while the credentialed call completes anyway, with no `task_id` to poll |
 | `MCP_INLINE_AUTH_ENABLED` | Optional (#848, default false) | Keyless MCP sign-in: a request with **no** `Authorization` header opens an anonymous session that may `request_login` / `verify_login` with a 6-digit email code, then use connector playbooks of agents shared with that address. A posture change on a network-exposed port — see [MCP Inline Email Auth](#mcp-inline-email-auth-issue-848). Requires `INTERNAL_API_SECRET`. Read by BOTH mcp-server (session gate) and backend (404s `/api/internal/mcp-auth/*` when off) |
 | `MCP_INLINE_AUTH_TIMEOUT_MS` | Optional (#848, default 15000) | mcp-server-only ceiling for the backend relay fetches on the inline-auth path, so a hung backend returns a structured error instead of an open socket |
 | `ASK_TRINITY_ENDPOINT` | Optional (#1981, default empty) | Endpoint backing the `ask_trinity` MCP docs-Q&A tool. Empty = the public Cloud Function. Point at an internal mirror, or at an unreachable URL to effectively disable it — it degrades to a structured error rather than crashing the call |
 | `TEMPLATE_REGISTRY_ENABLED` / `TEMPLATE_REGISTRY_URL` | Optional (#2033, **default true** / vendor URL) | The GitHub half of the agent-template catalog is fetched at runtime from a vendor-published `registry.yaml`. It only **adds** entries; every failure mode degrades to the bundled list. `false` is the HARD kill switch — no admin toggle or `system_settings` row can re-enable it, and it is the air-gap answer. **Not** coupled to `DO_NOT_TRACK` (a registry fetch is a package-index read, like npm), but it *is* outbound egress on a default install. URL is HTTPS-only, SSRF-validated, redirects refused |
-| `TRINITY_DEFAULT_SKILL_SOURCE` / `_REF` | Optional (#1901, default community repo @ `v0.2.0` since #2551) | Bundled community skills source, seeded on **fresh installs only** (a bump reaches new installs and nothing else). Pinned to a tag, never a branch head — the catalog takes public PRs and skills carry executables. Set the URL to `""` to disable the seed. Compose passes these **bare** (not `${VAR:-}`) precisely so an explicit empty value still means "disabled" |
+| `TRINITY_DEFAULT_SKILL_SOURCE` / `_REF` | Optional (#1901, default community repo @ `v0.2.0` at v0.9.5 (#2551), `v0.5.0` at v1.0.0 (#3123 / #3430)) | Bundled community skills source, seeded on **fresh installs only** (a bump reaches new installs and nothing else). Pinned to a tag, never a branch head — the catalog takes public PRs and skills carry executables. Set the URL to `""` to disable the seed. Compose passes these **bare** (not `${VAR:-}`) precisely so an explicit empty value still means "disabled" |
 | `SKILLS_RECONCILE_MAX_REMOVALS` / `SKILLS_FLEET_INJECT_CONCURRENCY` | Optional (#1883, default 10 / 5) | Skills-library lifecycle automation: blast-radius cap (a start-path reconcile refuses above this many removals per agent) and parallelism of a fleet re-inject sweep. The auto-sync / auto-re-inject **toggles** live in Settings (`system_settings`), not here; the loop runs on one Redis-leader worker |
 | `PORTAL_CHAT_BURST_LIMIT` / `PORTAL_CHAT_HOURLY_LIMIT` / `PORTAL_UPLOAD_BURST_LIMIT` / `PORTAL_UPLOAD_HOURLY_LIMIT` / `PORTAL_TITLE_MODEL` / `PORTAL_TITLE_TIMEOUT_SECONDS` | Optional (#2084, defaults 20 / 300 / 20 / 100 / `claude-haiku-4-5-20251001` / 15) | Workspace (client portal) rate limits and thread-title model. The limits are **enforced at these defaults whether or not the vars are set** — these only tune them |
 | `PORTAL_FILE_BURST_LIMIT` / `PORTAL_FILE_HOURLY_LIMIT` / `PORTAL_FILE_DELETE_BURST_LIMIT` | Optional (#2582, v0.9.5, defaults 20 / 100 / 60) | Workspace file **downloads** per client email per 60s / 3600s, and deletes per 60s. Deliberately tighter than uploads: reading a file back out of an agent inbox is the only path exposing `extract_from_agent` (a synchronous docker-py tar read on the shared 4-worker executor, ~3× file size in RAM) to a rostered client, and the hourly tier is the one that binds. (`PORTAL_RATING_BURST_LIMIT` / `_HOURLY_LIMIT` exist in code — 60 / 300 — but are forwarded by no compose file, so they are inert in `.env`) |
 | `TRINITY_PREINSTALL_PLUGINS` / `TRINITY_PLATFORM_PLUGINS` | Optional (ent#411/#2284, defaults 1 / 1) | Base-image build arg that bakes the `abilityai/abilities` marketplace + `trinity@abilityai` plugin into the image (never fatal; `[base-image] withheld trinity@abilityai: …` names the failed step), and the agent-side runtime opt-out. Older workspace volumes receive the plugin from the boot reconciler (`plugins_reinstall`, now runs even for agents declaring no plugins); state in `~/.trinity/plugins-state.json`, compatibility INFO check I-006 |
+| `OPERATOR_PLATFORM_ALERT_LIFETIME_DAYS` / `OPERATOR_PLATFORM_ALERT_SNOOZE_DAYS` | Optional (#3246, v1.0.0, defaults 14 / 7) | A platform alert expires this many days after its **last** reading; after a person ends one, the same reading files nothing for the snooze window unless its priority rises or a material field changes. A bad value falls back to the default with a WARNING. Forwarded by all three compose files |
+| `INTER_AGENT_MAX_CHAIN_DEPTH` | Optional (#2806, v1.0.0, unset → 8, bounds 1–32) | Agent-to-agent hops one call chain may take; a hop past it gets 403 `inter_agent_depth_exceeded`. A **fallback**, not an override: a value saved with `PUT /api/settings/ops/config` (`inter_agent_max_chain_depth`) wins. Leave it unset unless you mean to pin it — a set variable is reported as the value's source and makes the Settings row read-only (ent#671). Forwarded by all three compose files |
+| `METRICS_RETENTION_DAYS` / `METRICS_DAILY_POINT_CAP` | Optional (ent#478, v1.0.0, unset → 365 / 100000) | Bootstrap values for recorded metric points: how long they are kept (0 = forever) and how many one agent may record per UTC day (0 = unlimited). Same fallback and read-only semantics as the row above; the ops keys are `metrics_retention_days` / `metrics_daily_point_cap`. Unlike the other windows, `metrics_retention_days` is not floor-seeded at boot when the env var is set |
+| `METRICS_RATE_LIMIT` / `METRICS_READ_RATE_LIMIT` / `OBJECTIVES_READ_RATE_LIMIT` | Optional (ent#478 / #479 / #666, defaults 60 / 240 / 60 per agent per 60s) | `record_metrics` calls, `GET /metrics` reads (tiles, dashboard binds, `get_metrics`), and objective reads (each fans out into the agent container; the Workspace role card shares the budget). Read at backend import → `compose up -d` to apply |
+| `MCP_REPORT_BACK_ENABLED` | Optional (#3232, v1.0.0, default true) | Delegation report-back: a `chat_with_agent(parallel=true, async=true)` made from a Slack, Telegram or Workspace turn has the delegated run post its outcome back into that conversation. `false` / `0` / `no` / `off` is the kill switch; any other value, empty included, leaves it on. mcp-server only — recreate it to apply |
+| `TELEGRAM_GROUP_CONTEXT_MAX_MESSAGES` / `TELEGRAM_GROUP_CONTEXT_MAX_AGE_HOURS` | Optional (ent#600, v1.0.0, empty → 40 / 24) | How much of a group's recent conversation a tagged Telegram turn carries. Empty, non-integer or non-positive values fall back. Per-group on/off lives in the Telegram panel. Group sessions are now keyed per chat, not per sender |
+| `NEVERMINED_MAX_INFLIGHT` / `NEVERMINED_FACILITATOR_WAIT_SECONDS` | Optional (v1.0.0, defaults 8 / 5.0) | Fleet-wide ceiling on concurrent x402 verify/settle calls to the Nevermined facilitator, and how long a call waits for a slot before answering "busy, retry". A priced agent's public URL needs no credential to make the backend dial out, so this is the bound that holds across IPs |
+| `READINESS_CHECK_TIMEOUT` | Optional (ent#689, v1.0.0, default 5) | Scheduler-only HTTP deadline for the readiness verdict on a calibrating companion's cron brief. Fails open. A held brief is a **skipped** execution with a reason, not a failure: check the agent's readiness stamp. Forwarded by all three compose files, absent from `.env.example` |
 | `TRINITY_INSTANCE_NAME` | Optional (#1997, default empty) | Label naming THIS instance in outbound canary alerts, so instances sharing one Slack webhook stay tellable apart (`[eu2] 🚨 S-01 …`). Unset is the norm: the resolver falls back to the first DNS label of `FRONTEND_URL`, then the first 8 chars of the installation id. Truncated to 32 hostname-shaped chars |
 
 ---
@@ -1566,7 +1882,7 @@ Those are not agents. Platform maintenance jobs file their alarms directly (bypa
 | `scripts/run.sh "cmd"` | Run command locally or via SSH |
 | `scripts/status.sh` | Quick health check |
 | `scripts/restart.sh` | Restart all Trinity services |
-| `scripts/update.sh` | Pull latest, rebuild, restart. Detects a **hosted** install (`COMPOSE_FILE=docker-compose.hosted.yml`) and delegates to `start.sh --hosted` instead of building; pre-checks `CREDENTIAL_ENCRYPTION_KEY` (ent#435 boot refusal); runs the one-shot agent restart-policy sweep (#2541) after the platform is up; waits for the ent#615 git token-scrub reports and flags agents that need attention plus the platform-token rotation |
+| `scripts/update.sh` | Pull latest, rebuild, restart. Detects a **hosted** install (`COMPOSE_FILE=docker-compose.hosted.yml`) and delegates to `start.sh --hosted` instead of building, after checking out the git tag that matches a pinned `TRINITY_IMAGE_TAG` (shallow tag clones included; `git pull` only when the checkout is on a branch); pre-checks `CREDENTIAL_ENCRYPTION_KEY` (ent#435 boot refusal); runs the one-shot agent restart-policy sweep (#2541) after the platform is up; waits for the ent#615 git token-scrub reports and flags agents that need attention plus the platform-token rotation; reports the database backend in service, a hosted install whose `.env` lost its `DATABASE_URL` line (#3159), and sign-in emails cleared by ent#720 |
 | `scripts/backup.sh` | Manual on-demand DB backup to `~/backups/` on the host — SQLite via `sqlite3 .backup` (never a raw `cp`), bundled-PG via `pg_dump -Fc`. The platform also backs itself up nightly (#2216) |
 | `scripts/tunnel.sh` | SSH tunnels for local browser access |
 
