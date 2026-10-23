@@ -6,7 +6,7 @@ Run Trinity on your own machine (macOS, Linux, or WSL2 on Windows).
 
 - Docker Desktop (macOS/Windows) or Docker Engine (Linux)
 - Git
-- 8 GB RAM recommended, 4 GB minimum
+- 8 GB RAM minimum (16 GB recommended for multiple agents)
 - 20 GB free disk
 
 ## Steps

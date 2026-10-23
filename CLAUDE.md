@@ -917,12 +917,12 @@ Key tables:
 
 Trinity runs on any Linux VM with Docker. Choose your provider:
 
-| Provider | Guide | Cheapest option |
+| Provider | Guide | Cheapest supported option |
 |----------|-------|-----------------|
-| **Hetzner** | `provision/hetzner.md` | CX23 at €3.49/month |
-| **Google Cloud** | `provision/gcp.md` | e2-medium ~$40/month |
-| **AWS** | `provision/aws.md` | t3.medium ~$30/month (manual) · t3a.large 8 GiB (`--provision --cloud aws`, v1.0.0) |
-| **DigitalOcean** | `provision/digitalocean.md` | s-2vcpu-4gb $24/month (manual) · s-4vcpu-8gb $48/month (one-command) |
+| **Hetzner** | `provision/hetzner.md` | CX33 at ~€6-7/month |
+| **Google Cloud** | `provision/gcp.md` | e2-standard-2 ~$65/month |
+| **AWS** | `provision/aws.md` | t3.large ~$60/month (manual) · t3a.large 8 GiB (`--provision --cloud aws`, v1.0.0) |
+| **DigitalOcean** | `provision/digitalocean.md` | s-4vcpu-8gb $48/month (manual or one-command) |
 | **Vultr** | `provision/vultr.md` | 8 GB plan (`--provision --cloud vultr`, v1.0.0) |
 | **Localhost** | `provision/localhost.md` | Free |
 
@@ -932,7 +932,7 @@ All guides provision Ubuntu 24.04 with Docker via cloud-init, then walk you thro
 
 The documented path (user guide: `https://docs.ability.ai/getting-started/deploying/digitalocean`; source in the `trinity-docs` repo) runs `trinity-do-create.sh` on **your** machine. It creates an `s-4vcpu-8gb` Ubuntu 24.04 droplet (~$48/month), provisions it, installs from prebuilt images, and waits for HTTPS on the droplet's IP. Full walkthrough: `provision/digitalocean.md`.
 
-**The script differs by tag.** At the `v0.9.5` tag it asks four questions, including the Claude subscription token, and registers the subscription itself, as described below. At `v1.0.0` (#2867) it asks **three**: admin password twice, region, droplet name. No Claude credential is asked for and the user-data carries only the admin password; Claude is connected in the browser on first sign-in (the blocking **Connect Claude** step takes a subscription token *or* an API key and validates it with Anthropic). A 1.0 droplet also runs on the bundled PostgreSQL (#3159). The script's default tag is `v1.0.0`. A live DigitalOcean 1-Click listing exists too (`marketplace.digitalocean.com/apps/trinity`); it can be deployed below the 4 GB / 2 vCPU minimum (#3009), so pick at least that size.
+**The script differs by tag.** At the `v0.9.5` tag it asks four questions, including the Claude subscription token, and registers the subscription itself, as described below. At `v1.0.0` (#2867) it asks **three**: admin password twice, region, droplet name. No Claude credential is asked for and the user-data carries only the admin password; Claude is connected in the browser on first sign-in (the blocking **Connect Claude** step takes a subscription token *or* an API key and validates it with Anthropic). A 1.0 droplet also runs on the bundled PostgreSQL (#3159). The script's default tag is `v1.0.0`. A live DigitalOcean 1-Click listing exists too (`marketplace.digitalocean.com/apps/trinity`); it can be deployed below the 8 GB floor (#3009), so pick at least 8 GB.
 
 **Prerequisites:** a DigitalOcean account; `doctl` (`brew install doctl`) signed in with `doctl auth init` using an API token with **Write** scope; a Claude Pro/Max subscription and its token from `claude setup-token` (the `sk-ant-oat01-…` value — an `sk-ant-api03-…` API key is rejected by the v0.9.5 script; either works in the browser step at v1.0.0); Claude Code (WSL on Windows).
 
@@ -987,8 +987,8 @@ Then close 80/443 with a cloud firewall. Closing them also stops Caddy renewing 
 
 | Resource | Minimum | Recommended |
 |----------|---------|-------------|
-| CPU | 1 vCPU | 2 vCPU |
-| RAM | 2 GB (source build) · **8 GB for `--hosted`** (upstream's stated minimum; `start.sh` does not check it, and only the Vultr first-boot script warns) | 4 GB+ |
+| CPU | 2 vCPU | 4 vCPU |
+| RAM | 8 GB (source build and `--hosted`; `start.sh` does not check it, and only the Vultr first-boot script warns) | 16 GB |
 | Disk | 20 GB | 50 GB |
 | OS | Ubuntu 22.04+ | Ubuntu 24.04 |
 

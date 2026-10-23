@@ -32,7 +32,7 @@ Upstream ships `scripts/deploy/trinity-do-create.sh` (#2380 / #2707). The user g
 bash <(curl -fsSL https://raw.githubusercontent.com/abilityai/trinity/<tag>/scripts/deploy/trinity-do-create.sh)
 ```
 
-`<tag>` is the release you want, e.g. `v1.0.0`, and the script deploys that same tag as its default `TRINITY_IMAGE_TAG`. Use a release tag, never an `-rc` one: the pre-release rc4 **1-Click image** never served HTTPS (#2862, fixed in v0.9.5). Override the tag with `TRINITY_IMAGE_TAG=… bash <(…)`. At `v1.0.0` the script's default tag is `v1.0.0`. The live DigitalOcean 1-Click listing (`marketplace.digitalocean.com/apps/trinity`) is the other route; it lets you pick a plan below the 4 GB / 2 vCPU minimum (#3009), so choose at least that size.
+`<tag>` is the release you want, e.g. `v1.0.0`, and the script deploys that same tag as its default `TRINITY_IMAGE_TAG`. Use a release tag, never an `-rc` one: the pre-release rc4 **1-Click image** never served HTTPS (#2862, fixed in v0.9.5). Override the tag with `TRINITY_IMAGE_TAG=… bash <(…)`. At `v1.0.0` the script's default tag is `v1.0.0`. The live DigitalOcean 1-Click listing (`marketplace.digitalocean.com/apps/trinity`) is the other route; it lets you pick a plan below the 8 GB floor (#3009), so choose at least 8 GB.
 
 Prompts, in order:
 1. Password, then the same password again. Secrets are read with `read -rs`, so they are not echoed and stay out of shell history.
@@ -139,12 +139,14 @@ Note: the backend port is not reachable from outside the box (the firewall drops
 
 | Resource | Value | Cost |
 |----------|-------|------|
-| Size | `s-2vcpu-4gb` (2 vCPU, 4 GB) | $24/month |
+| Size | `s-4vcpu-8gb` (4 vCPU, 8 GB) | $48/month |
 | Region | `nyc3` or `fra1` | included |
 | OS | Ubuntu 24.04 LTS | free |
 | Backups | weekly automated | +$4.80/month |
 
-Need more headroom? Use `s-2vcpu-8gb` ($48/month).
+**Minimum: 8 GB RAM.** Below that the agent containers and the platform services contend and turns start failing under load.
+
+Need more headroom for a larger fleet? Step up to a 16 GB size — `doctl compute size list` shows the ones your account can create.
 
 ## Upload Your SSH Key
 
@@ -178,7 +180,7 @@ EOF
 doctl compute droplet create trinity-server \
   --region nyc3 \
   --image ubuntu-24-04-x64 \
-  --size s-2vcpu-4gb \
+  --size s-4vcpu-8gb \
   --ssh-keys $KEY_ID \
   --user-data-file /tmp/trinity-init.sh \
   --enable-monitoring \

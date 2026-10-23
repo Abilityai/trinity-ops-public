@@ -28,11 +28,11 @@ If not provided, present the options:
 
 | Provider | Size | Cost | Guide |
 |----------|------|------|-------|
-| Hetzner | CX23 (2 vCPU, 4GB) | €3.49/mo | provision/hetzner.md |
-| DigitalOcean | s-2vcpu-4gb (manual) · s-4vcpu-8gb (one-command, hosted images) | $24 · $48/mo | provision/digitalocean.md |
-| AWS | t3.medium (manual) · t3a.large 8 GiB (one-command, after v0.9.5) | ~$30/mo · more | provision/aws.md |
+| Hetzner | CX33 (4 vCPU, 8GB) | ~€6-7/mo | provision/hetzner.md |
+| DigitalOcean | s-4vcpu-8gb (4 vCPU, 8GB) — manual or one-command | $48/mo | provision/digitalocean.md |
+| AWS | t3.large (manual) · t3a.large (one-command, after v0.9.5) — 2 vCPU, 8GB | ~$60/mo | provision/aws.md |
 | Vultr | 8 GB plan (one-command, after v0.9.5) | plan price | provision/vultr.md |
-| GCP | e2-medium (2 vCPU, 4GB) | ~$40/mo | provision/gcp.md |
+| GCP | e2-standard-2 (2 vCPU, 8GB) | ~$65/mo | provision/gcp.md |
 | Localhost | Any OS with Docker | Free | provision/localhost.md |
 ```
 
